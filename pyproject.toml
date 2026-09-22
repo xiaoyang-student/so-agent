@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "so-agent"
+version = "0.1.0"
+description = "多 Agent 编排框架：主 Agent 驱动任务分解、动态子 Agent、评审与人机升级"
+requires-python = ">=3.10"
+dependencies = [
+    "openai-agents>=0.22.0,<0.23",
+    "openai>=3.0.0,<4",
+    "pydantic>=2.12.2,<3",
+    "pydantic-settings>=2.0",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+so_agent = ["api_config.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+pythonpath = ["src"]

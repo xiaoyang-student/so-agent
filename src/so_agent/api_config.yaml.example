@@ -1,0 +1,7 @@
+# API 连接配置示例：复制为 api_config.yaml 并填入真实密钥。
+provider: dashscope
+model: qwen3.8-max
+base_url: https://maas.qianwenaiapi.com/compatible-mode/v1
+timeout: 300
+retry: 1
+api_key: your-api-key-here

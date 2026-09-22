@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# API 配置（含密钥）
+**/api_config.yaml
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 沙箱运行产物
+sandbox/task_*/
+sandbox/artifacts/
+sandbox/workspace/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 测试缓存
+.pytest_cache/
+.coverage
+htmlcov/
