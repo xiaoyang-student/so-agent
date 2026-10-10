@@ -243,3 +243,20 @@ class TestEventPayloads:
         router.route_message(CHILD_A, SUPERVISOR, {"i": 2})
         messages = [r["payload"]["message"]["i"] for r in routed_events(events)]
         assert messages == [1, 2]
+
+
+class TestCircularReferenceMessage:
+    def test_self_referencing_message_does_not_recurse(self, router, events):
+        payload: dict = {"phase": "x"}
+        payload["self"] = payload  # 自引用
+        router.route_message(SUPERVISOR, CHILD_A, payload)  # 不抛 RecursionError
+        message = routed_events(events)[0]["payload"]["message"]
+        assert message["self"] == "<circular-reference>"
+
+    def test_mutual_list_reference_serializable(self, router, events):
+        a: list = []
+        b: list = [a]
+        a.append(b)  # 互相引用
+        router.route_message(SUPERVISOR, CHILD_A, {"pair": a})
+        payload = routed_events(events)[0]["payload"]
+        json.dumps(payload, ensure_ascii=False)  # 可序列化即通过

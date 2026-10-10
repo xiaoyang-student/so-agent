@@ -6,7 +6,7 @@
 由调用方剥离围栏后按 Pydantic 契约手动校验。
 
 本文件回归验证该容错链路的每一环：
-- ``json_utils``：围栏剥离与 JSON 对象提取；
+- ``json_utils``：围栏剥离、JSON 对象提取与 json-repair 宽容修复；
 - ``workflow._coerce_structured_output``：四形态宽容解析；
 - ``orchestrator`` 阶段性精简契约（PlanningOutput / ExecutionOutput /
   AggregationOutput）的宽容归一化；
@@ -88,7 +88,7 @@ class TestStripCodeFences:
 
 
 class TestExtractJsonObject:
-    """extract_json_object：整体解析 → 贪心子串提取。"""
+    """extract_json_object：整体解析 → 贪心子串提取 → json-repair 修复。"""
 
     def test_fenced_json(self):
         assert extract_json_object(fence('{"a": 1}')) == {"a": 1}
@@ -113,8 +113,19 @@ class TestExtractJsonObject:
     def test_none_returns_none(self):
         assert extract_json_object(None) is None
 
-    def test_unbalanced_braces_return_none(self):
-        assert extract_json_object('{"a": 1') is None
+    def test_unbalanced_braces_repaired(self):
+        # 截断/不平衡的 JSON 由 json-repair 兜底修复（不再直接判 None）
+        assert extract_json_object('{"a": 1') == {"a": 1}
+
+    def test_trailing_comma_repaired(self):
+        assert extract_json_object('{"a": 1,}') == {"a": 1}
+
+    def test_missing_comma_repaired(self):
+        assert extract_json_object('{"a": 1 "b": 2}') == {"a": 1, "b": 2}
+
+    def test_repair_non_object_result_rejected(self):
+        # json-repair 修复结果不是对象（list/str 等）时仍返回 None
+        assert extract_json_object("{not valid json}") is None
 
 
 class TestCoerceStructuredOutput:

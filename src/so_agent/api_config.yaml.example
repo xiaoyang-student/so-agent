@@ -1,7 +1,25 @@
-# API 连接配置示例：复制为 api_config.yaml 并填入真实密钥。
-provider: dashscope
-model: qwen3.8-max
-base_url: https://maas.qianwenaiapi.com/compatible-mode/v1
-timeout: 300
-retry: 1
-api_key: your-api-key-here
+# API 连接配置示例：复制为 api_config.yaml 并按需修改。本文件不含真实密钥。
+#
+# 密钥安全约定（推荐 api_key_env）：
+# - api_key_env 只声明存放密钥的环境变量名，密钥本身不落盘；
+#   可通过 shell 环境变量注入（PowerShell：$env:SO_AGENT_API_KEY = "sk-..."），
+#   或写入项目根目录 secrets.yaml（该文件不入版本控制，main.py 启动时
+#   自动加载其键值对到环境变量）。
+# - api_key 直接写密钥值仅为向后兼容保留，不推荐；两者至少配置一个。
+provider: your-provider
+model: your-model-name
+base_url: https://your-endpoint.example.com/v1   # 删除此行则使用 provider 默认地址
+timeout: 120
+retry: 2
+api_key_env: SO_AGENT_API_KEY
+
+# 超时语义说明（重要）：
+# - timeout 是模型 HTTP 客户端层的总超时；可选的 connect_timeout /
+#   read_timeout / write_timeout / pool_timeout 为分维度超时，其中
+#   read_timeout 是两次读之间的间隔上限（流式下即 chunk 间隔），
+#   而非整次请求总时长。任一分维度配置后，总预算仍取 timeout。
+# - 整体执行预算由运行时的五层流式超时控制（first_event / model_idle /
+#   tool_execution / agent_total / pipeline deadline，默认值见
+#   src/so_agent/config.py 与 README「主要默认配置」表），与本文件的
+#   HTTP 超时互不相同、互不替代：HTTP 超时负责单次请求快速失败，
+#   运行时窗口负责总时长兜底。

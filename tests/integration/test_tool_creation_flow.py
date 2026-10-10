@@ -65,10 +65,37 @@ class FakeRunResult:
         self.final_output = final_output
 
 
+class FakeStreamedResult:
+    """假 RunResultStreaming：首次取流式事件时求值协程工厂并回填输出。
+
+    正常路径下取到假事件后迭代结束，返回对象（final_output 已就绪）；
+    ``cancel`` 记录超时收尾路径。
+    """
+
+    def __init__(self, run_call):
+        self._run_call = run_call
+        self.final_output = None
+        self.raw_responses = []
+        self.cancelled = False
+
+    def cancel(self, mode="immediate"):
+        self.cancelled = True
+
+    async def stream_events(self):
+        result = await self._run_call()
+        self.final_output = result.final_output
+        self.raw_responses = getattr(result, "raw_responses", None) or []
+        yield {"type": "fake_event"}
+
+
 def install_fake_runner(
     monkeypatch, *, orchestrator, review_agent, supervisor, reviews
 ):
-    """把 workflow 模块内的 Runner 替换为按 Agent 身份分派的假 Runner。"""
+    """把 workflow 模块内的 Runner 替换为按 Agent 身份分派的假 Runner。
+
+    主管 Agent 经 ``run_streamed``（run_agent_streamed 的流式入口），
+    评审仍走 ``run``。
+    """
 
     class FakeRunner:
         @classmethod
@@ -78,6 +105,14 @@ def install_fake_runner(
                 return FakeRunResult(await reviews(review_input))
             payload = json.loads(input)
             return FakeRunResult(await supervisor(payload))
+
+        @classmethod
+        def run_streamed(cls, starting_agent, input=None, *, max_turns=None, **kwargs):
+            return FakeStreamedResult(
+                lambda: cls.run(
+                    starting_agent, input=input, max_turns=max_turns, **kwargs
+                )
+            )
 
     monkeypatch.setattr(workflow_mod, "Runner", FakeRunner)
 
@@ -169,8 +204,9 @@ class FakeCodeAgentServer:
 class GapSupervisor:
     """模拟主管：各计划版本按脚本声明 allowed_tools（含未注册的工具缺口）。"""
 
-    def __init__(self, *, plans: list[list[str]]):
+    def __init__(self, *, plans: list[list[str]], num_subtasks: int = 1):
         self.plan_tools = list(plans)
+        self.num_subtasks = num_subtasks
         self.payloads: list[dict] = []
         self.exec_payloads: dict[str, list[dict]] = {}
 
@@ -208,6 +244,17 @@ class GapSupervisor:
             allowed_tools=list(self.plan_tools[index]),
             max_attempts=3,
         )
+        subtasks = [spec]
+        # 添加辅助子任务以绕过快速通道（需要结果评审时）
+        for i in range(2, self.num_subtasks + 1):
+            subtasks.append(SubtaskSpec(
+                subtask_id=f"s{i}",
+                title=f"辅助子任务 s{i}",
+                instructions=f"辅助工作 s{i}",
+                role="code",
+                allowed_tools=[],
+                max_attempts=3,
+            ))
         return OrchestratorOutput(
             task_id=str(payload.get("task_id") or "stub-task"),
             status=(
@@ -215,7 +262,7 @@ class GapSupervisor:
                 if payload.get("phase") == "replanning"
                 else TaskStatus.PLANNING
             ),
-            plan_versions=[[spec]],
+            plan_versions=[subtasks],
         )
 
     def _execution_output(self, payload: dict) -> OrchestratorOutput:
@@ -263,6 +310,7 @@ class ReviewScript:
                 stage="result_review",
                 passed=passed,
                 issues=[] if passed else ["整体结果不满足验收标准"],
+                required_fixes=[] if passed else ["修复整体结果后重新提交"],
                 retry_target=None if passed else "s1",
                 summary="结果评审（模拟）",
             )
@@ -277,6 +325,7 @@ def build_env(
     code_succeed=True,
     tool_results=(True,),
     result_results=(True,),
+    num_subtasks=1,
 ):
     """组装环境：临时 generated_tools 目录 + 假代码 Agent MCP Server + 引擎。"""
     generated_dir = tmp_path / "generated_tools"
@@ -290,7 +339,7 @@ def build_env(
     mcp_client = MCPClient()
     mcp_client.connect(code_server.server)
     registry = ToolRegistry(generated_tools_dir=generated_dir)
-    supervisor = GapSupervisor(plans=plans)
+    supervisor = GapSupervisor(plans=plans, num_subtasks=num_subtasks)
     reviews = ReviewScript(tool_results=tool_results, result_results=result_results)
     orchestrator = SimpleNamespace(name="fake-supervisor")
     review_agent = SimpleNamespace(name="fake-reviewer")
@@ -341,19 +390,22 @@ class TestToolGapCreationFlow:
     async def test_gap_created_reviewed_registered_then_authorized(
         self, tmp_path, monkeypatch
     ):
+        # 3 个子任务绕过快速通道，确保结果评审触发返工（验证工具复用）
         env = build_env(
             tmp_path,
             monkeypatch,
             plans=[[WORK_TOOL]],
             result_results=[False, True],  # 一次返工，验证工具复用
+            num_subtasks=3,
         )
 
-        output = await env.engine.run("基于记录渲染 CSV 报表")
+        output = await env.engine.run("基于记录渲染 CSV 报表", acceptance_criteria="通过验收")
 
-        # 1) 缺口处理顺序：发现缺口 → 创建候选 → 注册（approved）
+        # 1) 缺口处理顺序：发现缺口 → 创建候选 → 沙箱验收（无测试用例跳过）→ 注册
         assert [event["action"] for event in tool_events(env.context)] == [
             "gap_detected",
             "candidate_created",
+            "tool_verify_skipped",
             "registered",
         ]
 
@@ -387,8 +439,11 @@ class TestToolGapCreationFlow:
         # 6) 工作流正常完成：工具创建流程与状态机协同
         assert output.status == TaskStatus.COMPLETED
         assert output.final_result == "含新注册工具产出的最终结果"
+        # 首轮 3 个子任务执行 + 汇总 + 返工 s1 执行 + 汇总
         assert env.supervisor.phases == [
             "planning",
+            "execute_subtask",
+            "execute_subtask",
             "execute_subtask",
             "aggregating",
             "execute_subtask",
@@ -421,11 +476,11 @@ class TestToolGapCreationFlow:
         assert reloaded.get_manifest(WORK_TOOL).review_status == "pending"
 
         # 3) 首版计划未调度执行（缺口失败在调度前拦截）→ 重规划后执行 v2
+        # v2 的单子任务快速通道跳过汇总
         assert env.supervisor.phases == [
             "planning",
             "replanning",
             "execute_subtask",
-            "aggregating",
         ]
         v2_exec = env.supervisor.exec_payloads["s1"][0]
         assert v2_exec["subtask"]["plan_version"] == 2
@@ -477,6 +532,7 @@ class TestToolGapCreationFlow:
         # 候选已存在：直接送评审（无 candidate_created），不重复调用代码 Agent
         assert [event["action"] for event in tool_events(env.context)] == [
             "gap_detected",
+            "tool_verify_skipped",
             "registered",
         ]
         assert env.code_server.calls == []
@@ -506,12 +562,11 @@ class TestToolGapCreationFlow:
         ]
         assert "代码 Agent 创建工具失败" in tool_events(env.context)[-1]["reason"]
 
-        # 无候选落盘；重规划后 v2 执行成功
+        # 无候选落盘；重规划后 v2 执行成功（快速通道）
         assert not (env.generated_dir / f"{WORK_TOOL}.py").exists()
         assert env.supervisor.phases == [
             "planning",
             "replanning",
             "execute_subtask",
-            "aggregating",
         ]
         assert output.status == TaskStatus.COMPLETED

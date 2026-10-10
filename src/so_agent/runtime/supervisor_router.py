@@ -41,16 +41,32 @@ class CommunicationError(Exception):
     """通信边界错误：横向通信、非法 JSON、消息身份不一致等。"""
 
 
-def _to_jsonable(value: Any) -> Any:
-    """将常见对象递归转换为 JSON 兼容形态（模型→dict、时间→ISO 字符串）。"""
+def _to_jsonable(value: Any, _seen: set[int] | None = None) -> Any:
+    """将常见对象递归转换为 JSON 兼容形态（模型→dict、时间→ISO 字符串）。
+
+    对自引用容器做循环检测，命中时以 ``"<circular-reference>"`` 占位，
+    避免无限递归导致 ``RecursionError``。
+    """
+    if _seen is None:
+        _seen = set()
     if isinstance(value, BaseModel):
-        return _to_jsonable(value.model_dump(mode="json"))
+        return _to_jsonable(value.model_dump(mode="json"), _seen)
     if isinstance(value, datetime):
         return value.isoformat()
-    if isinstance(value, dict):
-        return {str(key): _to_jsonable(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple, set, frozenset)):
-        return [_to_jsonable(item) for item in value]
+    if isinstance(value, (dict, list, tuple, set, frozenset)):
+        marker = id(value)
+        if marker in _seen:
+            return "<circular-reference>"
+        _seen.add(marker)
+        try:
+            if isinstance(value, dict):
+                return {
+                    str(key): _to_jsonable(item, _seen)
+                    for key, item in value.items()
+                }
+            return [_to_jsonable(item, _seen) for item in value]
+        finally:
+            _seen.discard(marker)
     return value
 
 

@@ -26,7 +26,6 @@
 对外接口::
 
     agent = create_orchestrator(context)     # 构造 SDK Agent 实例
-    agent = get_orchestrator()               # 便捷入口（默认上下文）
 
 全局约束（最高优先级）：所有 Agent 之间的通信必须严格使用 JSON
 （Pydantic 模型序列化/反序列化），主管 Agent 的输入输出同样受此约束。
@@ -47,7 +46,12 @@ from so_agent.context import ProjectContext
 from so_agent.mcp.adapter import mcp_server_to_agent_tool
 from so_agent.mcp.client import MCPClient
 from so_agent.models import AgentRecord, HumanEscalationRequest, SubtaskSpec, TaskStatus
-from so_agent.runtime.config_loader import AgentAPIConfig, load_agent_api_config
+from so_agent.runtime.config_loader import (
+    AgentAPIConfig,
+    load_agent_api_config,
+    resolve_model_http_timeout,
+)
+from so_agent.runtime.permissions import PermissionGateway
 from so_agent.runtime.registry import AgentRegistry
 from so_agent.runtime.tool_registry import ToolRegistry, ToolRegistryError
 from so_agent.tool_packages.code_agent.agent import (
@@ -95,11 +99,12 @@ SUPERVISOR_INSTRUCTIONS = """\
 
 ## 阶段协议（控制层以输入 JSON 中的 phase 字段标记当前阶段）
 1. `phase="planning"`：首次拆解任务。
-   - 输入：`orchestrator_input`（objective / constraints / acceptance_criteria）、`plan_version`、`available_tools`（JSON 对象数组，含 name / description / source / approved）。
+   - 输入：`orchestrator_input`（objective / constraints / acceptance_criteria）、`plan_version`、`available_tools`（JSON 对象数组，含 name / description / source / approved）。首次规划不提供任何历史结果与可复用候选。
    - 输出契约（PlanningOutput）：`{"subtasks": [SubtaskSpec, ...]}`——只含 subtasks 一个字段。
-   - 每个 SubtaskSpec 必须写全：`subtask_id`（本计划内唯一）、`title`、`instructions`（具体可执行）、`role`、`dependencies`（前置 subtask_id 数组）、`allowed_tools`（只能从 available_tools 清单或你声明需要创建的动态工具名中选取，无必要工具时用空数组）、`expected_output`、`max_attempts`。
+   - 每个 SubtaskSpec 必须写全：`subtask_id`（本计划内唯一）、`title`、`instructions`（具体可执行）、`role`、`dependencies`（前置 subtask_id 数组）、`allowed_tools`（只能从 available_tools 清单或你声明需要创建的动态工具名中选取，无必要工具时用空数组）、`expected_output`、`max_attempts`、`reuse_from`（可选，首次规划恒为 null，无需输出该字段）。
 2. `phase="replanning"`：根据分解问题或评审反馈重新拆解。
-   - 输入额外包含 `previous_plan`（上一版计划）、`decomposition_issue`（失败诊断）、`review_feedback`（评审不通过结论）。
+   - 输入额外包含：`previous_plan`（上一版计划）、`decomposition_issue`（失败诊断）、`review_feedback`（评审不通过结论）、`reuse_candidates`（上一版已有结果的子任务清单：旧 plan_version、subtask_id、语义字段、success、输出摘要、evidence、artifacts，失败项含 failure_diagnosis）与 `failure_cascade_scope`（失败级联范围：失败子任务及其全部下游，这些旧结果已被失败污染，绝不可声明复用）。
+   - 结果复用纪律（显式声明制，控制层只校验安全硬约束，语义判断由你负责）：当且仅当你**确信**某个旧子任务的语义与产出对新计划仍然完全适用时，才在新 SubtaskSpec 的 `reuse_from` 字段填写该旧子任务的 subtask_id（来源仅限 `reuse_candidates` 中 success=true 且不在 `failure_cascade_scope` 内的条目）；任何不确定都留空 `reuse_from` 并让该任务重新执行；**严禁仅因 subtask_id 同名或名称相近而复用**；严禁复用失败项或被失败污染的下游结果。声明复用的新任务，其 `instructions` / `role` / `expected_output` 必须与来源完全一致，`dependencies` 只允许因被复用任务改名而同步改名（新旧依赖集合必须一一对应），`allowed_tools` 不得超出来源范围，否则声明会被控制层的安全校验拒绝并回退重新执行。
    - 输出契约同 planning（PlanningOutput）；新计划必须针对诊断与反馈作出实质修改，禁止重复已失败的方案。
 3. `phase="execute_subtask"`：执行单个子任务。
    - 输入：`task_request`、`subtask`（SubtaskSpec）、`agent`（AgentRecord）、`attempt`（第几次尝试）、`grant`（该子任务签发的 ToolGrant，可能为 null）。
@@ -152,6 +157,21 @@ class OrchestratorOutput(BaseModel):
     human_escalation: HumanEscalationRequest | None = Field(
         default=None, description="人工升级材料包（仅 human_required 终态时填充）"
     )
+
+
+def _normalize_json_field(data: dict[str, Any], field: str) -> dict[str, Any]:
+    """宽容归一化通用件：把 dict/list 类型的字段值序列化为 JSON 文本。
+
+    主管 Agent 以纯文本 JSON 输出时，可能把 ``final_result`` 等文本
+    字段直接写成对象/数组（未做字符串转义）；本函数将这类字段值统一
+    转为 JSON 文本，其余值原样保留，供各阶段输出契约的 before 校验复用。
+    """
+    value = data.get(field)
+    if isinstance(value, (dict, list)):
+        normalized = dict(data)
+        normalized[field] = json.dumps(value, ensure_ascii=False, default=str)
+        return normalized
+    return data
 
 
 class PlanningOutput(BaseModel):
@@ -210,17 +230,10 @@ class ExecutionOutput(BaseModel):
         if not isinstance(data, dict):
             return data
         if "final_result" not in data and (
-            "subtask_id" in data or ("success" in data and "output" in data)
+            "subtask_id" in data or "success" in data
         ):
             return {"final_result": json.dumps(data, ensure_ascii=False, default=str)}
-        value = data.get("final_result")
-        if isinstance(value, (dict, list)):
-            normalized = dict(data)
-            normalized["final_result"] = json.dumps(
-                value, ensure_ascii=False, default=str
-            )
-            return normalized
-        return data
+        return _normalize_json_field(data, "final_result")
 
 
 class AggregationOutput(BaseModel):
@@ -235,15 +248,9 @@ class AggregationOutput(BaseModel):
     @classmethod
     def _normalize_payload(cls, data: Any) -> Any:
         """宽容归一化：final_result 为对象/数组时自动序列化为文本。"""
-        if isinstance(data, dict):
-            value = data.get("final_result")
-            if isinstance(value, (dict, list)):
-                normalized = dict(data)
-                normalized["final_result"] = json.dumps(
-                    value, ensure_ascii=False, default=str
-                )
-                return normalized
-        return data
+        if not isinstance(data, dict):
+            return data
+        return _normalize_json_field(data, "final_result")
 
 
 # ---------------------------------------------------------------------------
@@ -277,7 +284,7 @@ def _build_chat_model(config: AgentAPIConfig) -> Model:
     client = AsyncOpenAI(
         api_key=api_key,
         base_url=config.base_url or None,
-        timeout=config.timeout,
+        timeout=resolve_model_http_timeout(config),
         max_retries=config.retry,
     )
     return OpenAIChatCompletionsModel(model=config.model, openai_client=client)
@@ -294,6 +301,7 @@ def create_orchestrator(
     registry: AgentRegistry | None = None,
     tool_registry: ToolRegistry | None = None,
     mcp_client: MCPClient | None = None,
+    gateway: PermissionGateway | None = None,
 ) -> Agent[Any]:
     """构造配置完毕的主管 Agent（SDK Agent 实例）。
 
@@ -310,6 +318,10 @@ def create_orchestrator(
             MCP 契约与 MCP Server 挂载进去；未提供时使用新建的默认注册表。
         mcp_client: MCP 客户端；提供时接入全部固定入口与已注册动态工具的
             MCP Server（统一发现与调用）；未提供时新建默认客户端。
+        gateway: 工具授权网关；提供时透传给 subagent_creator，使其对
+            注入动态子 Agent 的每个工具执行运行时校验（verify_grant，
+            构造时注入 + 运行时校验双重防护）；应传入与规划阶段签发
+            槽位授权的同一网关实例；未提供时保持仅构造时过滤。
 
     Returns:
         ``Agent`` 实例：name="supervisor_agent"，tools 严格等于三个固定工具
@@ -329,16 +341,22 @@ def create_orchestrator(
     )
     resolved_mcp_client = mcp_client if mcp_client is not None else MCPClient()
 
-    # 三个固定入口：构造 MCP Server（统一 MCP 暴露），挂载注册表并接入客户端
+    # 三个固定入口：构造 MCP Server（统一 MCP 暴露），挂载注册表并接入客户端。
+    # gateway 仅在显式提供时透传给 subagent_creator（启用运行时权限校验）；
+    # 未提供时保持旧调用契约（仅构造时过滤），兼容既有装配方式。
+    subagent_creator_kwargs: dict[str, Any] = {
+        "settings": resolved_settings,
+        "registry": registry,
+        "tool_registry": resolved_tool_registry,
+    }
+    if gateway is not None:
+        subagent_creator_kwargs["gateway"] = gateway
     mcp_servers: dict[str, Any] = {
         "code_agent": get_code_agent_mcp_server(
             resolved_context, settings=resolved_settings
         ),
         "subagent_creator": get_subagent_creator_mcp_server(
-            resolved_context,
-            settings=resolved_settings,
-            registry=registry,
-            tool_registry=resolved_tool_registry,
+            resolved_context, **subagent_creator_kwargs
         ),
         "review_agent": get_review_agent_mcp_server(
             resolved_context, settings=resolved_settings
@@ -378,40 +396,4 @@ def create_orchestrator(
         instructions=SUPERVISOR_INSTRUCTIONS,
         tools=tools,
         model=resolved_model,
-    )
-
-
-def get_orchestrator(
-    context: ProjectContext | None = None,
-    *,
-    settings: Settings | None = None,
-    model: str | Model | None = None,
-    registry: AgentRegistry | None = None,
-    tool_registry: ToolRegistry | None = None,
-    mcp_client: MCPClient | None = None,
-) -> Agent[Any]:
-    """便捷函数：按默认上下文（cwd/sandbox）构造主管 Agent。
-
-    与 ``create_orchestrator`` 的区别：context 可省略；每次调用都会构造
-    新的实例（主管 Agent 在运行期与具体 ProjectContext 绑定）。
-
-    Args:
-        context: 项目共享上下文；未提供时使用默认沙箱目录（cwd/sandbox）。
-        settings: 生效配置；未提供时取 context.config（再回退全局配置）。
-        model: 主管 Agent 的模型覆盖（透传 create_orchestrator）。
-        registry: 运行时 Agent 注册表（透传 create_orchestrator）。
-        tool_registry: 工具注册表（透传 create_orchestrator）。
-        mcp_client: MCP 客户端（透传 create_orchestrator）。
-
-    Returns:
-        ``Agent`` 实例：name="supervisor_agent"，tools 严格为三个固定工具入口。
-    """
-    resolved_context = _resolve_context(context)
-    return create_orchestrator(
-        resolved_context,
-        settings=settings,
-        model=model,
-        registry=registry,
-        tool_registry=tool_registry,
-        mcp_client=mcp_client,
     )

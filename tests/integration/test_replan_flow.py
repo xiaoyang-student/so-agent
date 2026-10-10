@@ -35,6 +35,7 @@ from so_agent.runtime.events import (
     EVENT_HUMAN_ESCALATION,
     EVENT_REPLAN,
     EVENT_STATUS_TRANSITION,
+    EVENT_TOOL_GRANTED,
 )
 from so_agent.tool_packages.review_agent.agent import ReviewInput, ReviewStage
 from so_agent.workflow import HumanEscalationHandler, WorkflowEngine
@@ -47,14 +48,38 @@ class FakeRunResult:
         self.final_output = final_output
 
 
+class FakeStreamedResult:
+    """假 RunResultStreaming：首次取流式事件时求值协程工厂并回填输出。
+
+    正常路径下取到假事件后迭代结束，返回对象（final_output 已就绪）；
+    ``cancel`` 记录超时收尾路径。
+    """
+
+    def __init__(self, run_call):
+        self._run_call = run_call
+        self.final_output = None
+        self.raw_responses = []
+        self.cancelled = False
+
+    def cancel(self, mode="immediate"):
+        self.cancelled = True
+
+    async def stream_events(self):
+        result = await self._run_call()
+        self.final_output = result.final_output
+        self.raw_responses = getattr(result, "raw_responses", None) or []
+        yield {"type": "fake_event"}
+
+
 def install_fake_runner(
     monkeypatch, *, orchestrator, review_agent, supervisor, reviews
 ):
     """把 workflow 模块内的 Runner 替换为按 Agent 身份分派的假 Runner。
 
-    workflow 模块以 ``Runner.run(agent, input=...)`` 调用主管/评审 Agent；
-    假 Runner 按 ``starting_agent`` 身份把输入分派给 supervisor / reviews
-    两个可调用对象（返回 OrchestratorOutput / ReviewDecision）。
+    主管 Agent 经 ``run_streamed``（run_agent_streamed 的流式入口），
+    评审仍走 ``run``；假 Runner 按 ``starting_agent`` 身份把输入分派给
+    supervisor / reviews 两个可调用对象（返回 OrchestratorOutput /
+    ReviewDecision）。
     """
 
     class FakeRunner:
@@ -65,6 +90,14 @@ def install_fake_runner(
                 return FakeRunResult(reviews(review_input))
             payload = json.loads(input)
             return FakeRunResult(supervisor(payload))
+
+        @classmethod
+        def run_streamed(cls, starting_agent, input=None, *, max_turns=None, **kwargs):
+            return FakeStreamedResult(
+                lambda: cls.run(
+                    starting_agent, input=input, max_turns=max_turns, **kwargs
+                )
+            )
 
     monkeypatch.setattr(workflow_mod, "Runner", FakeRunner)
 
@@ -186,6 +219,7 @@ class ReviewScript:
                 stage="result_review",
                 passed=self.result_passed,
                 issues=[] if self.result_passed else ["整体结果不满足验收标准"],
+                required_fixes=[] if self.result_passed else ["修复整体结果后重新提交"],
                 summary="结果评审（模拟）",
             )
         else:
@@ -279,8 +313,15 @@ class TestPlanReviewQuotaExhaustion:
         assert len(request.plan_history) == 4
         assert request.final_review is not None
         assert request.final_review.passed is False
-        # 每版计划均签发工具授权 → 至少包含对应授权事件
-        assert len(request.tool_call_evidence) == 4
+        # Task #31：被拒计划不签发真实授权 —— 无 tool_granted 事件，
+        # 工具证据中没有任何授权记录（被拒无 grant 的审计证据）
+        granted_events = [
+            record
+            for record in context.event_log
+            if record["event_type"] == EVENT_TOOL_GRANTED
+        ]
+        assert granted_events == []
+        assert request.tool_call_evidence == []
 
         # 升级事件
         escalation_events = [
@@ -436,24 +477,24 @@ class TestReplanSucceedsWithinQuota:
 
         output = await engine.run("编写演示工具", constraints="使用 Python")
 
-        # 第三次拆解通过评审 → 执行、汇总、终审通过 → completed
+        # 第三次拆解通过评审 → 执行（产出过短不走快速通道）→ 汇总 → 结果评审 → completed
         assert output.status == TaskStatus.COMPLETED
         assert engine.current_status == TaskStatus.COMPLETED
-        assert output.final_result == "最终结果文本"
+        # 单子任务汇总走透传：最终结果为执行产出原文
+        assert output.final_result == "模拟子任务产出"
         assert engine.replan_count == 2  # 前两轮不通过各消耗一次额度
         assert engine.plan_version == 3
         assert len(output.plan_versions) == 3
-        assert handler.pending_requests == []  # 未触发人工兜底
+        assert handler.pending_requests == []  # 未触发人工兑底
 
-        # 阶段调用序列：规划 → 执行（一次成功）→ 汇总
+        # 阶段调用序列：规划 → 执行（单子任务汇总透传，不调主管 aggregating）
         assert supervisor.phases == [
             "planning",
             "replanning",
             "replanning",
             "execute_subtask",
-            "aggregating",
         ]
-        # 计划评审 3 批 × 2 轮 + 结果评审 1 次
+        # 计划评审 3 批 × 2 轮 + 结果评审 1 轮（产出过短不走快速通道）
         assert len(reviews.calls) == 7
         assert [decision.passed for decision in reviews.decisions] == [
             False,
@@ -465,7 +506,7 @@ class TestReplanSucceedsWithinQuota:
             True,
         ]
 
-        # 完整状态序列直至完成
+        # 完整状态序列直至完成（executing → aggregating → result_review → completed）
         assert status_transitions(context) == [
             ("received", "planning"),
             ("planning", "plan_review"),
@@ -496,9 +537,9 @@ class TestNetworkFailuresDoNotConsumeReplanQuota:
         assert output.status == TaskStatus.COMPLETED
         assert engine.replan_count == 0
         assert engine.plan_version == 1
-        # 1 次超时 + 规划重试 + 执行 + 汇总；重试后的阶段序列完整
-        assert supervisor.calls == 4
-        assert supervisor.phases == ["planning", "execute_subtask", "aggregating"]
+        # 1 次超时 + 规划重试 + 执行 = 3 次；快速通道不汇总
+        assert supervisor.calls == 3
+        assert supervisor.phases == ["planning", "execute_subtask"]
         assert handler.pending_requests == []
 
         # 重试进度提示（脱敏：只报异常类名）

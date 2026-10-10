@@ -3,7 +3,7 @@
 为编排器（orchestrator）提供与具体业务无关的基础设施：
 
 - registry：动态 Agent 的登记与生命周期管理（AgentRegistry）；
-- scheduler：子任务依赖求解与并发调度（TaskScheduler）；
+- scheduler：子任务依赖求解与并发调度（SubtaskDAGScheduler）；
 - sandbox：受限的代码/命令执行环境（SandboxRunner）；
 - tool_registry：生成工具的注册与查询（ToolRegistry）；
 - permissions：工具授权（ToolGrant）的签发与校验（PermissionGateway）；
@@ -31,7 +31,7 @@ from so_agent.runtime.registry import (
     AgentRegistryError,
 )
 from so_agent.runtime.sandbox import SandboxError, SandboxRunner
-from so_agent.runtime.scheduler import SchedulerError, TaskExecutor, TaskScheduler
+from so_agent.runtime.scheduler import SchedulerError, TaskExecutor, SubtaskDAGScheduler
 from so_agent.runtime.supervisor_router import CommunicationError, SupervisorRouter
 from so_agent.runtime.tool_registry import (
     DEFAULT_BUILTIN_AGENTS,
@@ -55,7 +55,7 @@ __all__ = [
     # scheduler
     "SchedulerError",
     "TaskExecutor",
-    "TaskScheduler",
+    "SubtaskDAGScheduler",
     # sandbox
     "SandboxError",
     "SandboxRunner",

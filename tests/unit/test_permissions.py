@@ -76,8 +76,35 @@ class FakeRunResult:
         self.final_output = final_output
 
 
+class FakeStreamedResult:
+    """假 RunResultStreaming：首次取流式事件时求值协程工厂并回填输出。
+
+    ``execute_subagent`` 经 ``run_agent_streamed`` 驱动流式执行；正常
+    路径下取到假事件后迭代结束，返回对象（final_output 已就绪）。
+    """
+
+    def __init__(self, run_call):
+        self._run_call = run_call
+        self.final_output = None
+        self.raw_responses = []
+        self.cancelled = False
+
+    def cancel(self, mode="immediate"):
+        self.cancelled = True
+
+    async def stream_events(self):
+        result = await self._run_call()
+        self.final_output = result.final_output
+        self.raw_responses = getattr(result, "raw_responses", None) or []
+        yield {"type": "fake_event"}
+
+
 def install_fake_runner(monkeypatch, captured_agents: list):
-    """把 subagent_creator 模块内的 Runner 替换为记录 agent 实例的假实现。"""
+    """把 subagent_creator 模块内的 Runner 替换为记录 agent 实例的假实现。
+
+    ``run_streamed`` 为 ``execute_subagent`` 的流式执行入口，与
+    ``run`` 共用同一记录逻辑。
+    """
 
     class FakeRunner:
         @classmethod
@@ -85,6 +112,14 @@ def install_fake_runner(monkeypatch, captured_agents: list):
             captured_agents.append(starting_agent)
             return FakeRunResult(
                 ExecutionResult(subtask_id="ignored", success=True, output="done")
+            )
+
+        @classmethod
+        def run_streamed(cls, starting_agent, input=None, *, max_turns=None, **kwargs):
+            return FakeStreamedResult(
+                lambda: cls.run(
+                    starting_agent, input=input, max_turns=max_turns, **kwargs
+                )
             )
 
     monkeypatch.setattr(creator_mod, "Runner", FakeRunner)

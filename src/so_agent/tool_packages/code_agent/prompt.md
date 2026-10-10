@@ -39,3 +39,18 @@
 - 失败时 `success` 为 `false`，`error` 填写错误类型与信息，`evidence` 保留失败现场证据；
 - `evidence` 与 `artifacts` 必须真实可复核，禁止编造；
 - 报告正文使用中文，代码、路径与命令保持原文。
+
+## 动态生成工具规范（write_generated_tool）
+
+当主 Agent 要求你**创建工具**（而非执行子任务）时，产出的工具须满足：
+
+1. **入口函数**：定义 `run(**kwargs)` 作为工具入口（也接受 `main` / `execute` 或与工具同名的函数）。
+2. **返回值必须是 JSON**：`run()` 的返回值必须是 JSON 可序列化（dict / list / 标量），
+   不得返回自定义对象、文件句柄等；这是硬约束，沙箱运行与验收都会强制校验，
+   非 JSON 返回会被判失败。
+3. **自证正确答案**：在 `manifest_data` 中提供 `test_cases`（验收测试用例数组，每项为
+   `run()` 的关键字参数对象）与 `expected_outputs`（与之一一对应的期望返回值，同样须
+   JSON 可序列化）。注册前系统会在沙箱中逐用例运行并比对期望输出，只有全部匹配的工具
+   才会通过验收并被注册使用。
+4. **写入**：调用 `write_generated_tool(tool_name, code, manifest_data)` 一次性写入代码
+   与清单（含上述测试用例）。

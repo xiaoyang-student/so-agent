@@ -1,7 +1,7 @@
 """命令行入口（CLI）。
 
-从命令行提交任务目标，组装运行时组件并运行完整编排工作流，
-最终把 ``OrchestratorOutput`` 以结构化 JSON 打印到标准输出。
+从命令行提交任务目标，组装运行时组件，经四象限路由器分类后
+运行对应工作流，最终把 ``OrchestratorOutput`` 以结构化 JSON 打印到标准输出。
 
 用法示例::
 
@@ -11,6 +11,8 @@
         --config runtime_config.yaml
 
 说明：
+- ``--daemon`` 启动持久化任务调度守护进程（后台轮询并执行到期任务，
+  此时无需提供任务目标）；
 - ``--config`` 指向 YAML / JSON 配置文件（键值映射），用于覆盖
   ``Settings`` 的默认字段（例如 max_concurrency、max_replan_attempts、
   sandbox_timeout 等）；文件不存在或字段非法时以退出码 2 结束；
@@ -31,15 +33,45 @@ import argparse
 import asyncio
 import json
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import yaml
 
+
+def _load_secrets() -> None:
+    """从项目根目录的 secrets.yaml 加载密钥到环境变量。
+
+    查找顺序：当前工作目录 → main.py 所在包的上三级目录（项目根）。
+    文件不存在时静默跳过（允许纯环境变量模式）。
+    """
+    import sys
+
+    candidates = [
+        Path.cwd() / "secrets.yaml",
+        Path(__file__).resolve().parent.parent.parent / "secrets.yaml",
+    ]
+    for path in candidates:
+        if path.is_file():
+            try:
+                data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+                if isinstance(data, dict):
+                    for key, value in data.items():
+                        if isinstance(key, str) and isinstance(value, str):
+                            os.environ.setdefault(key, value)
+                    print(f"[so-agent] 已从 {path} 加载密钥配置", file=sys.stderr)
+            except Exception:
+                pass
+            return
+
+
+_load_secrets()
+
 from so_agent.config import Settings, get_settings
 from so_agent.context import ProjectContext
 from so_agent.models import TaskStatus
-from so_agent.workflow import WorkflowEngine
+from so_agent.router import TaskRouter
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -47,8 +79,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="so-agent",
         description=(
-            "多 Agent 编排框架 CLI：提交任务目标，运行完整编排工作流"
-            "（拆解 → 计划评审 → 执行 → 失败升级 → 汇总 → 结果评审），"
+            "多 Agent 编排框架 CLI：提交任务目标，经四象限路由器分类后"
+            "运行对应工作流（路由分类 → 对应路径执行），"
             "并输出结构化 JSON 结果。"
         ),
     )
@@ -87,6 +119,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--project-name",
         default="so-agent",
         help="项目名称（用于标识任务空间，默认 so-agent）。",
+    )
+    parser.add_argument(
+        "--daemon",
+        action="store_true",
+        default=False,
+        help="启动持久化任务调度守护进程（后台轮询并执行到期任务）。",
     )
     return parser
 
@@ -175,7 +213,8 @@ def _configure_stdout() -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """CLI 主入口：解析参数 → 组装运行时 → 运行工作流 → 打印 JSON 结果。
+    """CLI 主入口：解析参数 → 组装运行时 → 路由分发（或调度守护进程）
+    → 打印 JSON 结果。
 
     Args:
         argv: 命令行参数列表；None 表示取 ``sys.argv[1:]``。
@@ -186,8 +225,8 @@ def main(argv: list[str] | None = None) -> int:
     """
     parser = build_parser()
     args = parser.parse_args(argv)
-    objective = _resolve_objective(parser, args.objective)
 
+    # 加载配置（daemon 与正常模式都需要）
     try:
         overrides = _load_config_overrides(args.config)
         settings = _resolve_settings(overrides)
@@ -199,11 +238,34 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     context = _build_context(args, settings)
-    engine = WorkflowEngine(context, settings=settings)
+    log_file = Path.cwd() / "logs" / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+    # --daemon 模式：启动调度守护进程（不执行新任务，无需任务目标）
+    if args.daemon:
+        from so_agent.persistence import TaskStore
+        from so_agent.task_scheduler import PeriodicTaskPoller
+
+        store = TaskStore(
+            Path(settings.task_store_path)
+            if Path(settings.task_store_path).is_absolute()
+            else context.sandbox_dir / settings.task_store_path
+        )
+        scheduler = PeriodicTaskPoller(store, context, settings)
+        try:
+            asyncio.run(scheduler.start())
+        except KeyboardInterrupt:
+            scheduler.stop()
+            print("[中断] 调度器被用户中断", file=sys.stderr)
+            return 130
+        return 0
+
+    # 正常模式：解析任务目标，经 TaskRouter 分类并路由执行
+    objective = _resolve_objective(parser, args.objective)
+    router = TaskRouter(context, settings, log_file=log_file)
 
     try:
         output = asyncio.run(
-            engine.run(objective, args.constraints, args.acceptance_criteria)
+            router.route(objective, args.constraints, args.acceptance_criteria)
         )
     except KeyboardInterrupt:
         print("[中断] 任务被用户中断", file=sys.stderr)

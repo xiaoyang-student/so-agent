@@ -288,18 +288,32 @@ class TestReviewDecision:
             decision = ReviewDecision(stage=stage, passed=True)
             assert decision.stage == stage
 
-    def test_stage_invalid_rejected(self):
-        with pytest.raises(ValueError):
-            ReviewDecision(stage="other_review", passed=True)  # type: ignore[arg-type]
+    def test_stage_accepts_arbitrary_string(self):
+        # Fix 2.3：stage 放宽为 str——评审 Agent 可能返回授权/工具评审
+        # 阶段值或中文阶段名，严格枚举会把内容正确的结论误判为解析失败。
+        for stage in ("authorization_review", "tool_review", "计划评审"):
+            decision = ReviewDecision(stage=stage, passed=True)
+            assert decision.stage == stage
 
     def test_defaults_and_roundtrip(self):
         decision = ReviewDecision(stage="plan_review", passed=False)
         assert decision.issues == []
+        assert decision.suggestions == []
         assert decision.required_fixes == []
         assert decision.retry_target is None
         assert decision.summary == ""
         restored = ReviewDecision.model_validate_json(decision.model_dump_json())
         assert restored == decision
+
+    def test_suggestions_field_roundtrip(self):
+        # 任务 32：suggestions 非阻断建议字段（序列化往返保持）
+        decision = ReviewDecision(
+            stage="plan_review",
+            passed=True,
+            suggestions=["建议补充边界用例"],
+        )
+        restored = ReviewDecision.model_validate_json(decision.model_dump_json())
+        assert restored.suggestions == ["建议补充边界用例"]
 
 
 class TestGeneratedToolManifest:

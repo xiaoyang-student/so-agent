@@ -1,1 +1,175 @@
-[]
+[
+  {
+    "tool_id": "tool-0f7b9c0b89af",
+    "tool_name": "run_go_in_sandbox",
+    "entry_file": "run_go_in_sandbox.py",
+    "description": "在沙箱中运行或静态分析 Go 源代码：校验参数后，dry_run 模式返回 package 子句/行数/字符数等静态信息；执行模式调用本机 go 工具链运行源码并返回 stdout/stderr/exit_code，无 go 环境时返回结构化 go_not_found 错误。所有返回值均为 JSON 可序列化 dict。",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "source": {
+          "type": "string",
+          "description": "Go 源代码文本，必须为非空字符串"
+        },
+        "timeout": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 30,
+          "default": 10,
+          "description": "执行超时秒数，取值 1-30"
+        },
+        "dry_run": {
+          "type": "boolean",
+          "default": false,
+          "description": "为 true 时仅静态分析不执行"
+        }
+      },
+      "required": [
+        "source"
+      ],
+      "additionalProperties": false
+    },
+    "output_schema": {
+      "type": "object",
+      "properties": {
+        "success": {
+          "type": "boolean"
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "validate",
+            "dry_run",
+            "run"
+          ]
+        },
+        "error_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "package": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "has_package_main": {
+          "type": "boolean"
+        },
+        "lines": {
+          "type": "integer"
+        },
+        "chars": {
+          "type": "integer"
+        },
+        "go_available": {
+          "type": "boolean"
+        },
+        "stdout": {
+          "type": "string"
+        },
+        "stderr": {
+          "type": "string"
+        },
+        "exit_code": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "success",
+        "mode"
+      ]
+    },
+    "created_by_task": "e83123aeb96a4d649ebcd16359455d6a",
+    "review_status": "pending",
+    "version": "1.0.0",
+    "mcp_schema": {
+      "name": "run_go_in_sandbox",
+      "description": "在沙箱中运行或静态分析 Go 源代码：校验参数后，dry_run 模式返回 package 子句/行数/字符数等静态信息；执行模式调用本机 go 工具链运行源码并返回 stdout/stderr/exit_code，无 go 环境时返回结构化 go_not_found 错误。所有返回值均为 JSON 可序列化 dict。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "source": {
+            "type": "string",
+            "description": "Go 源代码文本，必须为非空字符串"
+          },
+          "timeout": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 30,
+            "default": 10,
+            "description": "执行超时秒数，取值 1-30"
+          },
+          "dry_run": {
+            "type": "boolean",
+            "default": false,
+            "description": "为 true 时仅静态分析不执行"
+          }
+        },
+        "required": [
+          "source"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "test_cases": [
+      {
+        "source": ""
+      },
+      {
+        "source": "package main",
+        "timeout": 60
+      },
+      {
+        "source": "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(\"hello\")\n}\n",
+        "dry_run": true
+      },
+      {
+        "source": "package main",
+        "dry_run": true
+      }
+    ],
+    "expected_outputs": [
+      {
+        "success": false,
+        "mode": "validate",
+        "error_type": "invalid_input",
+        "error": "source 必须为非空字符串"
+      },
+      {
+        "success": false,
+        "mode": "validate",
+        "error_type": "invalid_input",
+        "error": "timeout 必须为 1 到 30 之间的整数"
+      },
+      {
+        "success": true,
+        "mode": "dry_run",
+        "package": "main",
+        "has_package_main": true,
+        "lines": 7,
+        "chars": 66
+      },
+      {
+        "success": true,
+        "mode": "dry_run",
+        "package": "main",
+        "has_package_main": true,
+        "lines": 1,
+        "chars": 12
+      }
+    ],
+    "verified": false
+  }
+]

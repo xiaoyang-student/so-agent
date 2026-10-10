@@ -97,12 +97,14 @@ class TestApiConfigFiles:
         ), f"{package} 缺少 {list(SECRET_FIELDS)} 中任一密钥配置字段"
 
     @pytest.mark.parametrize("package", AGENT_PACKAGES)
-    def test_secret_configured_directly(self, package):
+    def test_secret_configured_via_env_name(self, package, monkeypatch):
         config = load_agent_api_config(PACKAGES_DIR / package / "api_config.yaml")
-        # 真实配置采用 api_key 直读方式：密钥值已随配置读取，且可正常解析
-        assert config.api_key
-        assert config.api_key_env is None
-        assert config.resolve_api_key() == config.api_key
+        # 真实配置采用 api_key_env 方式：明文密钥不落盘于配置文件，
+        # 密钥值通过环境变量注入后可正常解析。
+        assert not config.api_key
+        assert config.api_key_env
+        monkeypatch.setenv(config.api_key_env, "sk-from-env")
+        assert config.resolve_api_key() == "sk-from-env"
 
 
 class TestAgentModules:

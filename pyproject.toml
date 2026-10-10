@@ -12,7 +12,9 @@ dependencies = [
     "openai>=3.0.0,<4",
     "pydantic>=2.12.2,<3",
     "pydantic-settings>=2.0",
+    "json-repair>=0.30",
     "pyyaml",
+    "python-statemachine>=3.0",
 ]
 
 [project.optional-dependencies]
@@ -25,7 +27,14 @@ dev = [
 where = ["src"]
 
 [tool.setuptools.package-data]
-so_agent = ["api_config.yaml"]
+# api_config.yaml：运行时由 config_loader 从包目录加载（顶层供路由分类、
+# 三个工具包各一份供对应 Agent 使用）；prompt.md：三个固定 Agent 的
+# 系统提示词，agent.py 以包目录相对路径读取，必须随包分发。
+so_agent = [
+    "api_config.yaml",
+    "tool_packages/*/api_config.yaml",
+    "tool_packages/*/prompt.md",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

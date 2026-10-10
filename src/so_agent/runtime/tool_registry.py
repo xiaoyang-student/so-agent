@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +52,44 @@ DEFAULT_BUILTIN_AGENTS: dict[str, tuple[str, str]] = {
 SUPERVISOR_EXCLUSIVE_TOOLS: frozenset[str] = frozenset(
     {"code_agent", "subagent_creator"}
 )
+
+
+class ToolTimeoutProfile(str, Enum):
+    """工具执行阶段的超时 profile（任务 45）。
+
+    workflow_support 在工具阶段（tool_called → tool_output）按实际
+    ``tool_name`` 解析 profile 并选取对应等待窗口，不再把长时工具
+    固定按普通工具窗口处理。profile 只影响工具阶段的等待窗口，
+    **绝不延长**任何 Agent 总预算（agent_total）或 Pipeline 总 deadline
+    ——所有窗口仍会被总预算截断。
+    """
+
+    STANDARD = "standard"          # 普通工具：tool_execution_timeout
+    CODE_AGENT = "code_agent"      # 长时代码 Agent：code_agent_tool_execution_timeout
+    SUBAGENT = "subagent"          # 嵌套子 Agent：subagent_tool_execution_timeout
+    SANDBOX = "sandbox"            # 沙箱/生成工具：max(tool_execution, sandbox_timeout)
+
+
+# 工具名 → 默认超时 profile 映射（任务 45）：覆盖固定入口与预置可分配
+# 工具中的长时类别；未列出的工具回退 STANDARD（或生成工具 → SANDBOX）。
+DEFAULT_TOOL_TIMEOUT_PROFILES: dict[str, ToolTimeoutProfile] = {
+    "code_agent": ToolTimeoutProfile.CODE_AGENT,
+    "subagent_creator": ToolTimeoutProfile.SUBAGENT,
+    "execute_subagent": ToolTimeoutProfile.SUBAGENT,
+    "run_in_sandbox": ToolTimeoutProfile.SANDBOX,
+}
+
+
+def timeout_profile_for_tool(tool_name: str | None) -> ToolTimeoutProfile:
+    """按工具名返回默认超时 profile（未知工具回退 STANDARD）。
+
+    独立模块函数：不依赖注册表实例也可判定（与 workflow_support 的
+    ``_SUBAGENT_TOOL_NAMES`` 判定同源兼容）；注册表实例优先使用
+    :meth:`ToolRegistry.get_timeout_profile`（额外识别生成工具）。
+    """
+    if tool_name and tool_name in DEFAULT_TOOL_TIMEOUT_PROFILES:
+        return DEFAULT_TOOL_TIMEOUT_PROFILES[tool_name]
+    return ToolTimeoutProfile.STANDARD
 
 # 预置可分配工具：子 Agent 可经授权获得的基础能力（与 code_agent 内部
 # 工具同名同源）；注册为内置工具，使"工具缺口检测"（未注册即缺口）
@@ -113,6 +152,7 @@ class ToolRegistry:
         generated_registry_path: str | Path | None = None,
         generated_tools_dir: str | Path | None = None,
         include_assignable_presets: bool = True,
+        sandbox: Any = None,
     ) -> None:
         """初始化注册表。
 
@@ -125,6 +165,9 @@ class ToolRegistry:
                 自动创建 MCPToolServer。
             include_assignable_presets: 是否注册预置可分配工具
                 （read_file / write_file / run_in_sandbox），默认 True。
+            sandbox: 可选沙箱执行器（SandboxRunner）；注册生成工具时注入
+                其 MCP Server，使工具在沙箱子进程执行；未提供时 handler
+                按默认配置惰性构造。
         """
         self._tools: dict[str, dict[str, Any]] = {}
         self._manifests: dict[str, GeneratedToolManifest] = {}
@@ -136,6 +179,7 @@ class ToolRegistry:
             if generated_tools_dir is not None
             else DEFAULT_GENERATED_TOOLS_DIR
         )
+        self._sandbox = sandbox
 
         source = builtin_agents if builtin_agents is not None else DEFAULT_BUILTIN_AGENTS
         for name, (description, agent_ref) in source.items():
@@ -245,7 +289,10 @@ class ToolRegistry:
         # 注册即自动创建 MCP Server（handler 惰性加载源码，调用时才读盘）
         try:
             self._mcp_servers[name] = generated_tool_to_mcp_server(
-                self._generated_tools_dir / manifest.entry_file, manifest
+                self._generated_tools_dir / manifest.entry_file,
+                manifest,
+                sandbox=self._sandbox,
+                generated_tools_root=self._generated_tools_dir,
             )
         except MCPAdapterError:
             self._mcp_servers.pop(name, None)
@@ -339,6 +386,21 @@ class ToolRegistry:
         """判断工具是否可分配给子 Agent（主管专属工具返回 False）。"""
         entry = self._tools.get(tool_name)
         return bool(entry is not None and entry.get("assignable", False))
+
+    def get_timeout_profile(self, tool_name: str | None) -> ToolTimeoutProfile:
+        """返回工具的执行阶段超时 profile（任务 45）。
+
+        判定顺序：显式映射（``DEFAULT_TOOL_TIMEOUT_PROFILES``，含
+        code_agent / subagent_creator / execute_subagent / run_in_sandbox）
+        > 注册来源为生成工具（沙箱内执行）→ SANDBOX > STANDARD。
+        未知工具名（None / 未注册）回退 STANDARD。
+        """
+        if tool_name and tool_name in DEFAULT_TOOL_TIMEOUT_PROFILES:
+            return DEFAULT_TOOL_TIMEOUT_PROFILES[tool_name]
+        entry = self._tools.get(tool_name or "")
+        if entry is not None and entry.get("source") == "generated":
+            return ToolTimeoutProfile.SANDBOX
+        return ToolTimeoutProfile.STANDARD
 
     def list_assignable_tools(self, *, approved_only: bool = False) -> list[dict[str, Any]]:
         """返回可分配工具清单（按字典序；元素为 JSON 兼容的元数据摘要）。

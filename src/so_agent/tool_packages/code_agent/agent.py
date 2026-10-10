@@ -62,7 +62,11 @@ from so_agent.mcp.adapter import agent_to_mcp_server
 from so_agent.mcp.protocol import MCPToolSchema
 from so_agent.mcp.server import MCPToolServer
 from so_agent.models import ExecutionResult, GeneratedToolManifest
-from so_agent.runtime.config_loader import AgentAPIConfig, load_agent_api_config
+from so_agent.runtime.config_loader import (
+    AgentAPIConfig,
+    load_agent_api_config,
+    resolve_model_http_timeout,
+)
 from so_agent.runtime.sandbox import SandboxError, SandboxRunner
 from so_agent.runtime.tool_registry import ToolRegistry, ToolRegistryError
 
@@ -260,7 +264,7 @@ def _build_chat_model(config: AgentAPIConfig) -> Model:
     client = AsyncOpenAI(
         api_key=api_key,
         base_url=config.base_url or None,
-        timeout=config.timeout,
+        timeout=resolve_model_http_timeout(config),
         max_retries=config.retry,
     )
     return OpenAIChatCompletionsModel(model=config.model, openai_client=client)
@@ -413,6 +417,9 @@ def build_code_tools(
             manifest_data: 清单元数据的 JSON 文本，可含 description /
                 input_schema / output_schema / mcp_schema / created_by_task /
                 version / tool_id 等字段；``created_by_task`` 建议填写所属任务编号。
+                还应提供 ``test_cases``（验收测试用例数组，每项为入口函数
+                ``run()`` 的关键字参数对象）与 ``expected_outputs``（与之一一
+                对应的期望返回值，须为 JSON 可序列化），供注册前沙箱验收比对。
 
         Returns:
             JSON 字符串：成功为 ``{"status": "ok", "code_path",
@@ -463,6 +470,10 @@ def build_code_tools(
                 encoding="utf-8",
             )
 
+            raw_test_cases = payload.get("test_cases")
+            test_cases = raw_test_cases if isinstance(raw_test_cases, list) else []
+            raw_expected = payload.get("expected_outputs")
+            expected_outputs = raw_expected if isinstance(raw_expected, list) else []
             manifest = GeneratedToolManifest(
                 tool_id=str(payload.get("tool_id") or f"tool-{uuid.uuid4().hex[:12]}"),
                 tool_name=tool_name,
@@ -474,6 +485,9 @@ def build_code_tools(
                 review_status="pending",
                 version=str(payload.get("version") or "0.1.0"),
                 mcp_schema=mcp_schema,
+                test_cases=test_cases,
+                expected_outputs=expected_outputs,
+                verified=False,
             )
             registry = ToolRegistry()
             if GENERATED_REGISTRY_PATH.is_file():

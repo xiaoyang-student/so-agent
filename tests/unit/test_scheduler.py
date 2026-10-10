@@ -1,4 +1,4 @@
-"""单元测试：子任务 DAG 调度器 TaskScheduler。"""
+"""单元测试：子任务 DAG 调度器 SubtaskDAGScheduler。"""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from so_agent.runtime.events import (
     EventLogger,
 )
 from so_agent.runtime.registry import AgentRegistry
-from so_agent.runtime.scheduler import SchedulerError, TaskScheduler
+from so_agent.runtime.scheduler import SchedulerError, SubtaskDAGScheduler
 
 
 def spec(
@@ -62,46 +62,46 @@ def success_executor(calls: list):
 
 class TestDagValidation:
     async def test_empty_subtask_list_rejected(self):
-        scheduler = TaskScheduler(failing_executor([]))
+        scheduler = SubtaskDAGScheduler(failing_executor([]))
         with pytest.raises(SchedulerError):
             await scheduler.schedule("t1", [])
 
     async def test_blank_task_id_rejected(self):
-        scheduler = TaskScheduler(failing_executor([]))
+        scheduler = SubtaskDAGScheduler(failing_executor([]))
         with pytest.raises(SchedulerError):
             await scheduler.schedule("", [spec("s1")])
 
     async def test_duplicate_ids_rejected(self):
-        scheduler = TaskScheduler(failing_executor([]))
+        scheduler = SubtaskDAGScheduler(failing_executor([]))
         with pytest.raises(SchedulerError):
             await scheduler.schedule("t1", [spec("s1"), spec("s1")])
 
     async def test_missing_dependency_rejected(self):
-        scheduler = TaskScheduler(failing_executor([]))
+        scheduler = SubtaskDAGScheduler(failing_executor([]))
         with pytest.raises(SchedulerError):
             await scheduler.schedule("t1", [spec("s1", deps=["ghost"])])
 
     async def test_self_dependency_rejected(self):
-        scheduler = TaskScheduler(failing_executor([]))
+        scheduler = SubtaskDAGScheduler(failing_executor([]))
         with pytest.raises(SchedulerError):
             await scheduler.schedule("t1", [spec("s1", deps=["s1"])])
 
     async def test_cycle_rejected(self):
-        scheduler = TaskScheduler(failing_executor([]))
+        scheduler = SubtaskDAGScheduler(failing_executor([]))
         with pytest.raises(SchedulerError):
             await scheduler.schedule(
                 "t1", [spec("s1", deps=["s2"]), spec("s2", deps=["s1"])]
             )
 
     def test_topological_order_chain(self):
-        scheduler = TaskScheduler(failing_executor([]))
+        scheduler = SubtaskDAGScheduler(failing_executor([]))
         order = scheduler.topological_order(
             [spec("s3", deps=["s2"]), spec("s2", deps=["s1"]), spec("s1")]
         )
         assert order.index("s1") < order.index("s2") < order.index("s3")
 
     def test_topological_order_preserves_relative_order(self):
-        scheduler = TaskScheduler(failing_executor([]))
+        scheduler = SubtaskDAGScheduler(failing_executor([]))
         order = scheduler.topological_order([spec("a"), spec("b"), spec("c")])
         assert order == ["a", "b", "c"]
 
@@ -114,7 +114,7 @@ class TestDependencyScheduling:
             order.append(task_spec.subtask_id)
             return ExecutionResult(subtask_id=task_spec.subtask_id, success=True)
 
-        scheduler = TaskScheduler(executor)
+        scheduler = SubtaskDAGScheduler(executor)
         results = await scheduler.schedule(
             "t1", [spec("s3", deps=["s2"]), spec("s2", deps=["s1"]), spec("s1")]
         )
@@ -122,7 +122,7 @@ class TestDependencyScheduling:
         assert all(result.success for result in results.values())
 
     async def test_failed_dependency_skips_dependent(self):
-        scheduler = TaskScheduler(failing_executor([]), settings=Settings(max_replacement_requests=0))
+        scheduler = SubtaskDAGScheduler(failing_executor([]), settings=Settings(max_replacement_requests=0))
         results = await scheduler.schedule(
             "t1", [spec("s1"), spec("s2", deps=["s1"])]
         )
@@ -133,14 +133,14 @@ class TestDependencyScheduling:
 
     async def test_independent_subtasks_all_executed(self):
         calls: list = []
-        scheduler = TaskScheduler(success_executor(calls))
+        scheduler = SubtaskDAGScheduler(success_executor(calls))
         results = await scheduler.schedule("t1", [spec("a"), spec("b"), spec("c")])
         assert set(results) == {"a", "b", "c"}
         assert all(result.success for result in results.values())
         assert {call[0] for call in calls} == {"a", "b", "c"}
 
     async def test_results_mirror_scheduler_state(self):
-        scheduler = TaskScheduler(success_executor([]))
+        scheduler = SubtaskDAGScheduler(success_executor([]))
         results = await scheduler.schedule("t1", [spec("s1")])
         assert scheduler.results is results
 
@@ -156,7 +156,7 @@ class TestConcurrencyLimit:
             state["active"] -= 1
             return ExecutionResult(subtask_id=task_spec.subtask_id, success=True)
 
-        scheduler = TaskScheduler(executor, settings=Settings(max_concurrency=2))
+        scheduler = SubtaskDAGScheduler(executor, settings=Settings(max_concurrency=2))
         await scheduler.schedule("t1", [spec(f"s{i}") for i in range(4)])
         assert state["peak"] <= 2
         assert state["peak"] >= 2  # 并发确实生效
@@ -171,16 +171,29 @@ class TestConcurrencyLimit:
             state["active"] -= 1
             return ExecutionResult(subtask_id=task_spec.subtask_id, success=True)
 
-        scheduler = TaskScheduler(executor, settings=Settings(max_concurrency=1))
+        scheduler = SubtaskDAGScheduler(executor, settings=Settings(max_concurrency=1))
         await scheduler.schedule("t1", [spec(f"s{i}") for i in range(3)])
         assert state["peak"] == 1
 
 
 class TestAttemptsAndReplacement:
     async def test_attempt_count_capped_at_three(self):
+        # 指纹互异的失败（不会触发同因抑制）才能跑满上限；
+        # 同指纹连续失败会在第 2 次被抑制（见 test_scheduler_recovery.py）
         calls: list = []
-        scheduler = TaskScheduler(
-            failing_executor(calls),
+        distinct_errors = ["未知错误甲", "未知错误乙", "未知错误丙"]
+
+        async def executor(task_spec: SubtaskSpec, agent: AgentRecord) -> ExecutionResult:
+            calls.append((task_spec.subtask_id, agent.agent_id, agent.attempt_count))
+            index = min(agent.attempt_count, len(distinct_errors)) - 1
+            return ExecutionResult(
+                subtask_id=task_spec.subtask_id,
+                success=False,
+                error=distinct_errors[index],
+            )
+
+        scheduler = SubtaskDAGScheduler(
+            executor,
             settings=Settings(max_agent_attempts=3, max_replacement_requests=0),
         )
         await scheduler.schedule("t1", [spec("s1")])
@@ -188,7 +201,7 @@ class TestAttemptsAndReplacement:
 
     async def test_spec_max_attempts_smaller_wins(self):
         calls: list = []
-        scheduler = TaskScheduler(
+        scheduler = SubtaskDAGScheduler(
             failing_executor(calls),
             settings=Settings(max_agent_attempts=3, max_replacement_requests=0),
         )
@@ -198,7 +211,7 @@ class TestAttemptsAndReplacement:
     async def test_replacement_flow_after_primary_exhaustion(self):
         primary_calls: list = []
         replacement_calls: list = []
-        scheduler = TaskScheduler(
+        scheduler = SubtaskDAGScheduler(
             failing_executor(primary_calls),
             replacement_executor=success_executor(replacement_calls),
             settings=Settings(max_agent_attempts=2, max_replacement_requests=1),
@@ -212,7 +225,7 @@ class TestAttemptsAndReplacement:
     async def test_replacement_agent_has_no_replacement_right(self):
         primary_calls: list = []
         replacement_calls: list = []
-        scheduler = TaskScheduler(
+        scheduler = SubtaskDAGScheduler(
             failing_executor(primary_calls),
             replacement_executor=failing_executor(replacement_calls),
             settings=Settings(max_agent_attempts=1, max_replacement_requests=1),
@@ -225,7 +238,7 @@ class TestAttemptsAndReplacement:
         assert replacement_calls[0][1] in scheduler.decomposition_issues[0].failed_agent_ids
 
     async def test_decomposition_issue_after_replacement_failure(self):
-        scheduler = TaskScheduler(
+        scheduler = SubtaskDAGScheduler(
             failing_executor([]),
             settings=Settings(max_agent_attempts=1, max_replacement_requests=1),
         )
@@ -241,7 +254,7 @@ class TestAttemptsAndReplacement:
         assert issue.recommendation
 
     async def test_no_replacement_when_quota_zero(self):
-        scheduler = TaskScheduler(
+        scheduler = SubtaskDAGScheduler(
             failing_executor([]),
             settings=Settings(max_agent_attempts=1, max_replacement_requests=0),
         )
@@ -251,7 +264,7 @@ class TestAttemptsAndReplacement:
         assert len(scheduler.decomposition_issues[0].failed_agent_ids) == 1
 
     async def test_replacement_request_payload(self):
-        scheduler = TaskScheduler(
+        scheduler = SubtaskDAGScheduler(
             failing_executor([]),
             settings=Settings(max_agent_attempts=1, max_replacement_requests=1),
         )
@@ -266,7 +279,7 @@ class TestAttemptsAndReplacement:
 
     async def test_replacement_quota_is_per_task_cumulative(self):
         """两次调度共享替换额度：第二次无法再发起替换。"""
-        scheduler = TaskScheduler(
+        scheduler = SubtaskDAGScheduler(
             failing_executor([]),
             settings=Settings(max_agent_attempts=1, max_replacement_requests=1),
         )
@@ -283,7 +296,7 @@ class TestTimeout:
             await asyncio.sleep(5)
             return ExecutionResult(subtask_id=task_spec.subtask_id, success=True)
 
-        scheduler = TaskScheduler(
+        scheduler = SubtaskDAGScheduler(
             executor,
             settings=Settings(max_agent_attempts=1, max_replacement_requests=0),
             attempt_timeout=0.2,
@@ -298,7 +311,7 @@ class TestExecutorRobustness:
         async def executor(task_spec: SubtaskSpec, agent: AgentRecord) -> ExecutionResult:
             raise RuntimeError("executor exploded")
 
-        scheduler = TaskScheduler(
+        scheduler = SubtaskDAGScheduler(
             executor,
             settings=Settings(max_agent_attempts=1, max_replacement_requests=0),
         )
@@ -311,7 +324,7 @@ class TestExecutorRobustness:
         async def executor(task_spec: SubtaskSpec, agent: AgentRecord):
             return "not-a-result"
 
-        scheduler = TaskScheduler(
+        scheduler = SubtaskDAGScheduler(
             executor,
             settings=Settings(max_agent_attempts=1, max_replacement_requests=0),
         )
@@ -324,7 +337,7 @@ class TestEventsAndRegistry:
     async def test_lifecycle_events_logged(self, tmp_path):
         context = ProjectContext(sandbox_dir=tmp_path, project_name="scheduler-test")
         events = EventLogger(context=context)
-        scheduler = TaskScheduler(
+        scheduler = SubtaskDAGScheduler(
             success_executor([]),
             context=context,
             settings=Settings(),
@@ -339,7 +352,7 @@ class TestEventsAndRegistry:
     async def test_failure_chain_events_logged(self, tmp_path):
         context = ProjectContext(sandbox_dir=tmp_path, project_name="scheduler-test")
         events = EventLogger(context=context)
-        scheduler = TaskScheduler(
+        scheduler = SubtaskDAGScheduler(
             failing_executor([]),
             context=context,
             settings=Settings(max_agent_attempts=1, max_replacement_requests=1),
@@ -355,7 +368,7 @@ class TestEventsAndRegistry:
     async def test_registry_registration_and_release(self, tmp_path):
         context = ProjectContext(sandbox_dir=tmp_path, project_name="scheduler-test")
         registry = AgentRegistry(context=context, settings=Settings(max_dynamic_agents=4))
-        scheduler = TaskScheduler(
+        scheduler = SubtaskDAGScheduler(
             success_executor([]), context=context, registry=registry
         )
         await scheduler.schedule("t1", [spec("s1")])
@@ -372,7 +385,7 @@ class TestEventsAndRegistry:
             await asyncio.sleep(0.05)  # 让 s1 注册后保持活跃，s2 注册必被拒
             return ExecutionResult(subtask_id=task_spec.subtask_id, success=True)
 
-        scheduler = TaskScheduler(
+        scheduler = SubtaskDAGScheduler(
             executor,
             context=context,
             settings=Settings(max_dynamic_agents=1, max_concurrency=2),

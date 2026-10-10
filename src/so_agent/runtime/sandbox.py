@@ -150,9 +150,12 @@ class SandboxRunner:
             timeout: 本次执行超时（秒）；默认取 ``settings.sandbox_timeout``。
 
         Returns:
-            ExecutionResult：subtask_id 填 run_id（沙箱层不感知子任务语义）；
-            success 为 退出码为 0 且未超时；artifacts 为 stdout.txt /
-            stderr.txt / metadata.json 的路径；evidence 为执行证据链。
+            ExecutionResult（ToolResponse 信封的领域扩展）：subtask_id 填
+            run_id（沙箱层不感知子任务语义）；success 为 退出码为 0 且未超时；
+            output 为 stdout 文本；失败时 error 携带 stderr 摘要或超时说明；
+            artifacts 为 stdout.txt / stderr.txt / metadata.json 的路径；
+            evidence 为执行证据链；metadata 携带 exit_code、duration_seconds、
+            timed_out、stdout_truncated、stderr_truncated 等结构化字段。
 
         Raises:
             SandboxError: 标识符非法、路径越界、代码为空、超时参数非法，
@@ -268,4 +271,13 @@ class SandboxRunner:
             artifacts=artifacts,
             error=error,
             duration=duration,
+            # ToolResponse 统一信封的扩展元数据：与落盘 metadata.json
+            # 同名同义，供调用方免解包读取关键诊断字段
+            metadata={
+                "exit_code": exit_code,
+                "duration_seconds": round(duration, 6),
+                "timed_out": timed_out,
+                "stdout_truncated": stdout_truncated,
+                "stderr_truncated": stderr_truncated,
+            },
         )

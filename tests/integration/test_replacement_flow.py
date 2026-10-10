@@ -21,7 +21,7 @@ from so_agent.runtime.events import (
     EventLogger,
 )
 from so_agent.runtime.registry import AgentRegistry
-from so_agent.runtime.scheduler import TaskScheduler
+from so_agent.runtime.scheduler import SubtaskDAGScheduler
 
 
 def make_spec(subtask_id: str = "s1", **kwargs) -> SubtaskSpec:
@@ -77,11 +77,11 @@ def build_env(tmp_path, **settings_kwargs):
 
 
 class TestPrimaryExhaustionProducesReplacementRequest:
-    async def test_three_failures_then_replacement_request(self, tmp_path):
+    async def test_same_cause_failures_then_replacement_request(self, tmp_path):
         context, settings, registry, events = build_env(tmp_path)
         primary = RecordingExecutor(False)
         replacement = RecordingExecutor(True)
-        scheduler = TaskScheduler(
+        scheduler = SubtaskDAGScheduler(
             primary,
             replacement_executor=replacement,
             context=context,
@@ -92,8 +92,8 @@ class TestPrimaryExhaustionProducesReplacementRequest:
 
         results = await scheduler.schedule("t1", [make_spec()])
 
-        # 原始 Agent 三次尝试全部失败后才申请替换
-        assert len(primary.calls) == 3
+        # 原始 Agent 同因两次尝试失败（第二次即抑制）后申请替换
+        assert len(primary.calls) == 2
         assert len(scheduler.replacement_requests) == 1
         request = scheduler.replacement_requests[0]
         assert request.request_count == 1
@@ -107,7 +107,7 @@ class TestPrimaryExhaustionProducesReplacementRequest:
 
     async def test_request_evidence_accumulated(self, tmp_path):
         context, settings, registry, events = build_env(tmp_path)
-        scheduler = TaskScheduler(
+        scheduler = SubtaskDAGScheduler(
             RecordingExecutor(False),
             replacement_executor=RecordingExecutor(False),
             context=context,
@@ -118,7 +118,7 @@ class TestPrimaryExhaustionProducesReplacementRequest:
         await scheduler.schedule("t1", [make_spec()])
         request = scheduler.replacement_requests[0]
         assert any("第 1 次尝试失败" in item for item in request.attempt_evidence)
-        assert any("第 3 次尝试失败" in item for item in request.attempt_evidence)
+        assert any("第 2 次尝试失败" in item for item in request.attempt_evidence)
 
 
 class TestReplacementAgentConstraints:
@@ -128,7 +128,7 @@ class TestReplacementAgentConstraints:
         )
         primary = RecordingExecutor(False)
         replacement = RecordingExecutor(False)
-        scheduler = TaskScheduler(
+        scheduler = SubtaskDAGScheduler(
             primary,
             replacement_executor=replacement,
             context=context,
@@ -150,7 +150,7 @@ class TestReplacementAgentConstraints:
         context, settings, registry, events = build_env(tmp_path)
         primary = RecordingExecutor(False)
         replacement = RecordingExecutor(False)
-        scheduler = TaskScheduler(
+        scheduler = SubtaskDAGScheduler(
             primary,
             replacement_executor=replacement,
             context=context,
@@ -173,7 +173,7 @@ class TestReplacementAgentConstraints:
         context, settings, registry, events = build_env(tmp_path)
         primary = RecordingExecutor(False)
         replacement = RecordingExecutor(False)
-        scheduler = TaskScheduler(
+        scheduler = SubtaskDAGScheduler(
             primary,
             replacement_executor=replacement,
             context=context,
@@ -199,7 +199,7 @@ class TestReplacementAgentConstraints:
 class TestDuplicateRequestRejected:
     async def test_second_replacement_blocked_after_quota_used(self, tmp_path):
         context, settings, registry, events = build_env(tmp_path)
-        scheduler = TaskScheduler(
+        scheduler = SubtaskDAGScheduler(
             RecordingExecutor(False),
             replacement_executor=RecordingExecutor(False),
             context=context,
@@ -221,7 +221,7 @@ class TestDuplicateRequestRejected:
 
     async def test_replacement_request_count_increments_only_when_allowed(self, tmp_path):
         context, settings, registry, events = build_env(tmp_path, max_replacement_requests=2)
-        scheduler = TaskScheduler(
+        scheduler = SubtaskDAGScheduler(
             RecordingExecutor(False),
             replacement_executor=RecordingExecutor(False),
             context=context,
@@ -240,7 +240,7 @@ class TestFullEventChain:
         context, settings, registry, events = build_env(tmp_path)
         primary = RecordingExecutor(False)
         replacement = RecordingExecutor(False)
-        scheduler = TaskScheduler(
+        scheduler = SubtaskDAGScheduler(
             primary,
             replacement_executor=replacement,
             context=context,
@@ -256,11 +256,9 @@ class TestFullEventChain:
             EVENT_AGENT_CREATED,
             EVENT_TASK_DISPATCHED,
             EVENT_TASK_DISPATCHED,
-            EVENT_TASK_DISPATCHED,
             EVENT_AGENT_RELEASED,
             EVENT_REPLACEMENT_REQUESTED,
             EVENT_AGENT_CREATED,
-            EVENT_TASK_DISPATCHED,
             EVENT_TASK_DISPATCHED,
             EVENT_TASK_DISPATCHED,
             EVENT_AGENT_RELEASED,
@@ -275,7 +273,7 @@ class TestFullEventChain:
 
     async def test_dispatched_events_track_attempts(self, tmp_path):
         context, settings, registry, events = build_env(tmp_path)
-        scheduler = TaskScheduler(
+        scheduler = SubtaskDAGScheduler(
             RecordingExecutor(False),
             replacement_executor=RecordingExecutor(False),
             context=context,
@@ -287,12 +285,12 @@ class TestFullEventChain:
 
         dispatched = events.get_events(event_type=EVENT_TASK_DISPATCHED)
         attempts = [(r["payload"]["agent_id"], r["payload"]["attempt"]) for r in dispatched]
-        assert len(attempts) == 6  # 原始 3 次 + 替代 3 次
-        assert [attempt for _, attempt in attempts] == [1, 2, 3, 1, 2, 3]
+        assert len(attempts) == 4  # 原始 2 次 + 替代 2 次（同因抑制）
+        assert [attempt for _, attempt in attempts] == [1, 2, 1, 2]
 
     async def test_replacement_requested_event_payload(self, tmp_path):
         context, settings, registry, events = build_env(tmp_path)
-        scheduler = TaskScheduler(
+        scheduler = SubtaskDAGScheduler(
             RecordingExecutor(False),
             replacement_executor=RecordingExecutor(False),
             context=context,
@@ -308,7 +306,7 @@ class TestFullEventChain:
 
     async def test_decomposition_issue_event_payload(self, tmp_path):
         context, settings, registry, events = build_env(tmp_path)
-        scheduler = TaskScheduler(
+        scheduler = SubtaskDAGScheduler(
             RecordingExecutor(False),
             replacement_executor=RecordingExecutor(False),
             context=context,

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -219,6 +220,24 @@ def mcp_server_to_agent_tool(server: MCPServer, tool_name: str) -> FunctionTool:
     )
 
 
+def _is_within(root: Path, target: Path) -> bool:
+    """判断 target 是否位于 root 之内（Windows 大小写不敏感）。"""
+    root_text = os.path.normcase(str(root))
+    target_text = os.path.normcase(str(target))
+    return target_text == root_text or target_text.startswith(root_text + os.sep)
+
+
+def _ensure_within(root: str | Path, target: str | Path, tool_name: str) -> None:
+    """校验生成工具入口位于根目录内，否则抛 MCPAdapterError（防路径穿越）。"""
+    root_path = Path(root).expanduser().resolve()
+    target_path = Path(target).expanduser().resolve()
+    if not _is_within(root_path, target_path):
+        raise MCPAdapterError(
+            f"生成工具入口越界：{tool_name!r} 的入口 {target_path} "
+            f"不在生成工具目录 {root_path} 之内（拒绝加载）"
+        )
+
+
 def _load_generated_tool_module(tool_path: str | Path, module_name: str) -> Any:
     """惰性加载生成工具源码模块（每次调用重新加载，保证源码更新即时生效）。
 
@@ -253,43 +272,56 @@ def _resolve_generated_entry(module: Any, tool_name: str) -> Any:
 
 
 def generated_tool_to_mcp_server(
-    tool_path: str | Path, manifest: GeneratedToolManifest
+    tool_path: str | Path,
+    manifest: GeneratedToolManifest,
+    *,
+    sandbox: "SandboxRunner | None" = None,
+    generated_tools_root: str | Path | None = None,
 ) -> MCPToolServer:
     """把动态生成工具包装为 MCP Server（单工具）。
+
+    工具在**沙箱子进程**执行（而非主进程 importlib 加载），返回值强制 JSON。
 
     Args:
         tool_path: 生成工具入口源码文件路径（``generated_tools/{name}.py``）。
         manifest: 生成工具清单（提供名称、描述与参数 schema）。
+        sandbox: 沙箱执行器；未提供时按默认配置惰性构造。
+        generated_tools_root: 生成工具根目录；提供时校验 ``tool_path`` 位于
+            其内（防路径穿越加载任意源码）。
 
     Returns:
-        ``MCPToolServer``：handler 惰性加载源码模块并调用其入口函数
-        （``run(**arguments)``），返回值规范化为 JSON 文本。
+        ``MCPToolServer``：handler 在沙箱子进程执行入口函数
+        （``run(**arguments)``），返回值为 JSON 文本。
 
     Raises:
-        MCPAdapterError: manifest 类型非法时。
+        MCPAdapterError: manifest 类型非法或 ``tool_path`` 越界时。
     """
     if not isinstance(manifest, GeneratedToolManifest):
         raise MCPAdapterError(
             f"manifest 必须是 GeneratedToolManifest，实际为 {type(manifest).__name__}"
         )
+    if generated_tools_root is not None:
+        _ensure_within(generated_tools_root, tool_path, manifest.tool_name)
 
     server = MCPToolServer(name=manifest.tool_name)
     schema = _schema_from_manifest(manifest)
 
-    def _handler(arguments: dict[str, Any]) -> str:
-        """加载源码并调用入口函数（同步；生成工具为纯计算函数）。"""
-        module = _load_generated_tool_module(tool_path, manifest.tool_name)
-        func = _resolve_generated_entry(module, manifest.tool_name)
-        if func is None:
-            raise MCPAdapterError(
-                f"生成工具 {manifest.tool_name!r} 缺少可调用入口"
-                f"（需定义 run(...) 等函数）：{tool_path}"
-            )
-        try:
-            outcome = func(**arguments)
-        except TypeError as exc:
-            raise ValueError(f"生成工具参数不匹配：{exc}") from exc
-        return stringify(outcome)
+    async def _handler(arguments: dict[str, Any]) -> str:
+        """在沙箱子进程执行入口函数（返回值强制 JSON 文本）。
+
+        加载失败/缺入口/执行失败抛 ``GeneratedToolExecutionError``（非
+        ValueError 子类），由 MCP Server 映射为 INTERNAL_ERROR（服务器侧
+        工具错误，而非参数校验失败）。
+        """
+        # 惰性导入：避免 mcp.adapter ↔ runtime 的模块级循环依赖
+        from so_agent.runtime.generated_tool_runner import run_generated_tool_in_sandbox
+        from so_agent.runtime.sandbox import SandboxRunner
+
+        runner = sandbox or SandboxRunner()
+        result = await run_generated_tool_in_sandbox(
+            runner, tool_path, manifest.tool_name, arguments
+        )
+        return json.dumps(result, ensure_ascii=False)
 
     server.register_tool(schema, _handler)
     return server

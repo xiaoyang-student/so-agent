@@ -17,11 +17,13 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
+import so_agent.tool_packages.code_agent.agent as code_agent_agent_mod
 import so_agent.workflow as workflow_mod
 from so_agent.config import Settings
 from so_agent.context import ProjectContext
 from so_agent.models import (
     ExecutionResult,
+    GeneratedToolManifest,
     ReviewDecision,
     SubtaskSpec,
     TaskStatus,
@@ -44,10 +46,38 @@ class FakeRunResult:
         self.final_output = final_output
 
 
+class FakeStreamedResult:
+    """假 RunResultStreaming：首次取流式事件时求值协程工厂并回填输出。
+
+    ``run_agent_streamed`` 经 ``stream_events()`` 异步迭代器驱动：正常
+    路径下取到假事件后迭代结束，返回对象（final_output 已就绪），
+    恰好模拟“流正常结束”；``cancel`` 记录超时收尾路径。
+    """
+
+    def __init__(self, run_call):
+        self._run_call = run_call
+        self.final_output = None
+        self.raw_responses = []
+        self.cancelled = False
+
+    def cancel(self, mode="immediate"):
+        self.cancelled = True
+
+    async def stream_events(self):
+        result = await self._run_call()
+        self.final_output = result.final_output
+        self.raw_responses = getattr(result, "raw_responses", None) or []
+        yield {"type": "fake_event"}
+
+
 def install_fake_runner(
     monkeypatch, *, orchestrator, review_agent, supervisor, reviews
 ):
-    """把 workflow 模块内的 Runner 替换为按 Agent 身份分派的假 Runner。"""
+    """把 workflow 模块内的 Runner 替换为按 Agent 身份分派的假 Runner。
+
+    主管调用经 ``run_streamed``（run_agent_streamed 的流式入口），评审
+    调用仍走 ``run``——两者共用同一分派逻辑。
+    """
 
     class FakeRunner:
         @classmethod
@@ -57,6 +87,14 @@ def install_fake_runner(
                 return FakeRunResult(reviews(review_input))
             payload = json.loads(input)
             return FakeRunResult(supervisor(payload))
+
+        @classmethod
+        def run_streamed(cls, starting_agent, input=None, *, max_turns=None, **kwargs):
+            return FakeStreamedResult(
+                lambda: cls.run(
+                    starting_agent, input=input, max_turns=max_turns, **kwargs
+                )
+            )
 
     monkeypatch.setattr(workflow_mod, "Runner", FakeRunner)
 
@@ -162,6 +200,7 @@ class ReviewScript:
                 stage="result_review",
                 passed=passed,
                 issues=[] if passed else ["整体结果不满足验收标准"],
+                required_fixes=[] if passed else ["修复整体结果后重新提交"],
                 retry_target=None if passed else self.result_retry_target,
                 summary="结果评审（模拟）",
             )
@@ -215,13 +254,19 @@ def status_transitions(context) -> list[tuple[str, str]]:
 
 class TestHappyPath:
     async def test_full_pipeline_state_sequence_and_calls(self, tmp_path, monkeypatch):
-        supervisor = FakeSupervisor()
+        # 使用 3 个子任务绕过快速通道（_is_simple_plan 要求 >2 子任务）
+        supervisor = FakeSupervisor(specs=[
+            make_spec("s1", tools=["write_file"]),
+            make_spec("s2"),
+            make_spec("s3"),
+        ])
         reviews = ReviewScript([True])
         context, engine = build_engine(
             tmp_path, monkeypatch, supervisor=supervisor, reviews=reviews
         )
 
-        output = await engine.run("编写演示模块")
+        # 提供验收标准以触发结果评审（all_success + 无标准会跳过）
+        output = await engine.run("编写演示模块", acceptance_criteria="通过验收")
 
         # 快乐路径完整状态序列
         assert status_transitions(context) == [
@@ -239,8 +284,12 @@ class TestHappyPath:
         assert engine.replan_count == 0
         assert len(output.plan_versions) == 1
 
-        # 主管调用：规划 → 执行（一次尝试成功）→ 汇总
-        assert supervisor.phases == ["planning", "execute_subtask", "aggregating"]
+        # 主管调用：规划 → 执行 ×3 → 汇总
+        assert supervisor.phases == [
+            "planning",
+            "execute_subtask", "execute_subtask", "execute_subtask",
+            "aggregating",
+        ]
         # 评审调用：计划 + 授权 + 结果（各一次）
         assert [call.stage for call in reviews.calls] == [
             ReviewStage.PLAN_REVIEW,
@@ -256,9 +305,9 @@ class TestHappyPath:
         assert grant["issued_by"] == "supervisor"
         assert exec_payload["subtask"]["allowed_tools"] == ["write_file"]
 
-        # Agent 生命周期：执行成功并释放
-        assert len(output.agent_history) == 1
-        assert output.agent_history[0].status == "completed"
+        # Agent 生命周期：3 个 Agent 全部执行成功并释放
+        assert len(output.agent_history) == 3
+        assert all(a.status == "completed" for a in output.agent_history)
 
     async def test_plan_tools_sanitized_and_grants_issued(self, tmp_path, monkeypatch):
         supervisor = FakeSupervisor(
@@ -293,21 +342,138 @@ class TestHappyPath:
         assert s2_payload["grant"] is None
 
 
+class TestResolveReworkTargets:
+    """返工目标解析：只认结构化标识，不做自由文本子串匹配（回归测试）。"""
+
+    def _engine(self, tmp_path, ids):
+        context = ProjectContext(sandbox_dir=tmp_path, project_name="rework-targets")
+        engine = WorkflowEngine(
+            context,
+            settings=Settings(_env_file=None),
+            orchestrator=SimpleNamespace(name="fake-supervisor"),
+            review_agent=SimpleNamespace(name="fake-reviewer"),
+        )
+        engine._task_request = SimpleNamespace(task_id="t1")
+        engine._subtasks = [make_spec(sid) for sid in ids]
+        return engine
+
+    def test_exact_retry_target_selects_single(self, tmp_path):
+        engine = self._engine(tmp_path, ["1", "11"])
+        decision = ReviewDecision(
+            stage="result_review", passed=False, retry_target="11"
+        )
+        assert engine._resolve_rework_targets(decision) == {"11"}
+
+    def test_agent_id_retry_target_resolved(self, tmp_path):
+        engine = self._engine(tmp_path, ["1", "11"])
+        decision = ReviewDecision(
+            stage="result_review", passed=False, retry_target="t1:11:code-ab12"
+        )
+        assert engine._resolve_rework_targets(decision) == {"11"}
+
+    def test_substring_in_free_text_not_matched(self, tmp_path):
+        # 回归：issues/required_fixes 中的短 id（"1"/"11"）不得被子串误命中
+        engine = self._engine(tmp_path, ["1", "11"])
+        engine._results = {
+            "1": ExecutionResult(subtask_id="1", success=True),
+            "11": ExecutionResult(subtask_id="11", success=True),
+        }
+        decision = ReviewDecision(
+            stage="result_review",
+            passed=False,
+            issues=["子任务 11 需返工，另有 1 处错误"],
+            required_fixes=["重新生成 11 的输出"],
+        )
+        assert engine._resolve_rework_targets(decision) == set()
+
+    def test_fallback_to_failed_results(self, tmp_path):
+        engine = self._engine(tmp_path, ["1", "11"])
+        engine._results = {
+            "1": ExecutionResult(subtask_id="1", success=True),
+            "11": ExecutionResult(subtask_id="11", success=False, error="x"),
+        }
+        decision = ReviewDecision(
+            stage="result_review", passed=False, retry_target=None
+        )
+        assert engine._resolve_rework_targets(decision) == {"11"}
+
+
+class TestVerifyGeneratedTool:
+    """沙箱运行验收：test_cases 比对正确答案，通过才置 verified。"""
+
+    def _engine(self, tmp_path):
+        context = ProjectContext(sandbox_dir=tmp_path, project_name="verify-tool")
+        engine = WorkflowEngine(
+            context,
+            settings=Settings(_env_file=None),
+            orchestrator=SimpleNamespace(name="fake-supervisor"),
+            review_agent=SimpleNamespace(name="fake-reviewer"),
+        )
+        engine._task_request = SimpleNamespace(task_id="t1")
+        return engine
+
+    def _manifest_with(self, gen_dir, expected):
+        gen_dir.mkdir(exist_ok=True)
+        (gen_dir / "demo_tool.py").write_text(
+            "def run(x):\n    return {'double': x * 2}\n", encoding="utf-8"
+        )
+        return GeneratedToolManifest(
+            tool_id="t",
+            tool_name="demo_tool",
+            entry_file="demo_tool.py",
+            created_by_task="task",
+            test_cases=[{"x": 3}],
+            expected_outputs=expected,
+        )
+
+    async def test_verify_passes_on_matching_output(self, tmp_path, monkeypatch):
+        engine = self._engine(tmp_path)
+        gen_dir = tmp_path / "gen"
+        manifest = self._manifest_with(gen_dir, [{"double": 6}])
+        monkeypatch.setattr(code_agent_agent_mod, "GENERATED_TOOLS_DIR", gen_dir)
+        verified, err = await engine._verify_generated_tool(manifest)
+        assert err is None
+        assert verified.verified is True
+
+    async def test_verify_fails_on_wrong_answer(self, tmp_path, monkeypatch):
+        engine = self._engine(tmp_path)
+        gen_dir = tmp_path / "gen"
+        manifest = self._manifest_with(gen_dir, [{"double": 999}])  # 错误期望
+        monkeypatch.setattr(code_agent_agent_mod, "GENERATED_TOOLS_DIR", gen_dir)
+        verified, err = await engine._verify_generated_tool(manifest)
+        assert err is not None
+        assert "不符" in err
+        assert verified.verified is False
+
+    async def test_verify_skips_without_test_cases(self, tmp_path):
+        engine = self._engine(tmp_path)
+        manifest = GeneratedToolManifest(
+            tool_id="t",
+            tool_name="demo_tool",
+            entry_file="demo_tool.py",
+            created_by_task="task",
+        )
+        verified, err = await engine._verify_generated_tool(manifest)
+        assert err is None
+        assert verified.verified is True
+
+
 class TestResultRework:
     async def test_rework_failed_subtask_then_completes(self, tmp_path, monkeypatch):
+        # 3 个子任务绕过快速通道，确保结果评审触发返工
         supervisor = FakeSupervisor(
-            specs=[make_spec("s1", tools=["write_file"]), make_spec("s2")]
+            specs=[make_spec("s1", tools=["write_file"]), make_spec("s2"), make_spec("s3")]
         )
         reviews = ReviewScript([True], result_results=[False, True])
         context, engine = build_engine(
             tmp_path, monkeypatch, supervisor=supervisor, reviews=reviews
         )
 
-        output = await engine.run("含返工的任务")
+        output = await engine.run("含返工的任务", acceptance_criteria="通过验收")
 
         assert output.status == TaskStatus.COMPLETED
         # 返工只重跑被指出的子任务 s1
-        assert supervisor.exec_sequence == ["s1", "s2", "s1"]
+        assert supervisor.exec_sequence == ["s1", "s2", "s3", "s1"]
         # 两轮汇总与两次结果评审
         assert supervisor.phases.count("aggregating") == 2
         result_calls = [
@@ -329,7 +495,12 @@ class TestResultRework:
         ]
 
     async def test_unresolvable_rework_target_escalates(self, tmp_path, monkeypatch):
-        supervisor = FakeSupervisor()
+        # 3 个子任务绕过快速通道，确保结果评审触发
+        supervisor = FakeSupervisor(specs=[
+            make_spec("s1", tools=["write_file"]),
+            make_spec("s2"),
+            make_spec("s3"),
+        ])
         reviews = ReviewScript(
             [True], result_results=False, result_retry_target=None
         )
@@ -337,30 +508,35 @@ class TestResultRework:
             tmp_path, monkeypatch, supervisor=supervisor, reviews=reviews
         )
 
-        output = await engine.run("无法定位返工目标")
+        output = await engine.run("无法定位返工目标", acceptance_criteria="通过验收")
 
         assert output.status == TaskStatus.HUMAN_REQUIRED
         assert "无法定位返工目标" in output.final_result
         # 结果评审不通过且 retry_target 为空：不进入返工，一次执行/汇总后直接兜底
-        assert supervisor.exec_sequence == ["s1"]
+        assert supervisor.exec_sequence == ["s1", "s2", "s3"]
         assert supervisor.phases.count("aggregating") == 1
         assert output.human_escalation is not None
         assert output.human_escalation.final_review is not None
         assert output.human_escalation.final_review.passed is False
 
     async def test_rework_quota_exhausted_escalates(self, tmp_path, monkeypatch):
-        supervisor = FakeSupervisor()
+        # 3 个子任务绕过快速通道，确保结果评审触发
+        supervisor = FakeSupervisor(specs=[
+            make_spec("s1", tools=["write_file"]),
+            make_spec("s2"),
+            make_spec("s3"),
+        ])
         reviews = ReviewScript([True], result_results=False)
         context, engine = build_engine(
             tmp_path, monkeypatch, supervisor=supervisor, reviews=reviews
         )
 
-        output = await engine.run("返工额度耗尽")
+        output = await engine.run("返工额度耗尽", acceptance_criteria="通过验收")
 
         assert output.status == TaskStatus.HUMAN_REQUIRED
         assert "结果评审返工次数耗尽仍未通过" in output.final_result
-        # 4 轮执行/汇总/评审：第 4 次不通过后返工额度（3 次）已耗尽
-        assert supervisor.exec_sequence == ["s1"] * 4
+        # 4 轮执行/汇总/评审：首轮 3 个子任务 + 3 轮返工 s1 = 共 6 次执行
+        assert supervisor.exec_sequence == ["s1", "s2", "s3", "s1", "s1", "s1"]
         assert supervisor.phases.count("aggregating") == 4
         assert [decision.passed for decision in reviews.decisions] == [
             True,
@@ -394,7 +570,15 @@ class TestWorkflowEdgeCases:
     async def test_empty_supervisor_summary_falls_back_locally(
         self, tmp_path, monkeypatch
     ):
-        supervisor = FakeSupervisor(empty_summary=True)
+        # 3 个子任务绕过快速通道，确保进入 LLM 汇总阶段
+        supervisor = FakeSupervisor(
+            specs=[
+                make_spec("s1", tools=["write_file"]),
+                make_spec("s2"),
+                make_spec("s3"),
+            ],
+            empty_summary=True,
+        )
         reviews = ReviewScript([True])
         context, engine = build_engine(
             tmp_path, monkeypatch, supervisor=supervisor, reviews=reviews
@@ -404,7 +588,7 @@ class TestWorkflowEdgeCases:
 
         assert output.status == TaskStatus.COMPLETED
         # 主管汇总不可用/为空 → 本地确定性摘要兜底
-        assert "共完成 1 个子任务" in output.final_result
+        assert "共完成 3 个子任务" in output.final_result
         assert "[s1] s1 完成（模拟）" in output.final_result
         assert "（汇总说明：主管 Agent 未返回汇总文本）" in output.final_result
 
@@ -447,6 +631,8 @@ class TestWorkflowEdgeCases:
 class TestSupervisorAssembly:
     def test_orchestrator_has_exactly_three_fixed_tools(self, tmp_path, monkeypatch):
         monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+        # 真实配置采用 api_key_env 方式：为配置声明的环境变量注入假密钥
+        monkeypatch.setenv("SO_AGENT_API_KEY", "sk-test")
         context = ProjectContext(sandbox_dir=tmp_path, project_name="assembly")
 
         agent = create_orchestrator(context, settings=Settings(_env_file=None))
@@ -489,9 +675,14 @@ class TestFencedJsonOutput:
                 self.payloads.append(payload)
                 phase = payload.get("phase")
                 if phase in ("planning", "replanning"):
-                    spec = make_spec("s1", tools=["write_file"])
+                    # 3 个子任务绕过快速通道
+                    specs = [
+                        make_spec("s1", tools=["write_file"]),
+                        make_spec("s2"),
+                        make_spec("s3"),
+                    ]
                     body = json.dumps(
-                        {"subtasks": [spec.model_dump(mode="json")]},
+                        {"subtasks": [spec.model_dump(mode="json") for spec in specs]},
                         ensure_ascii=False,
                     )
                 elif phase == "execute_subtask":
@@ -537,12 +728,17 @@ class TestFencedJsonOutput:
             tmp_path, monkeypatch, supervisor=supervisor, reviews=reviews
         )
 
-        output = await engine.run("编写演示模块")
+        # 提供验收标准以触发结果评审
+        output = await engine.run("编写演示模块", acceptance_criteria="通过验收")
 
         # 围栏包裹的纯文本输出不影响全流程：完成终态、结果正确
         assert output.status == TaskStatus.COMPLETED
         assert output.final_result == "最终结果文本"
-        assert supervisor.phases == ["planning", "execute_subtask", "aggregating"]
+        assert supervisor.phases == [
+            "planning",
+            "execute_subtask", "execute_subtask", "execute_subtask",
+            "aggregating",
+        ]
         assert status_transitions(context) == [
             ("received", "planning"),
             ("planning", "plan_review"),

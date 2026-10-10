@@ -1,9 +1,135 @@
-This project still has many unresolved issues. My current vision for the multi-agent system adopts a two-tier architecture: a supervisor agent and subordinate agents. Three specialized agents — the code agent, review agent, and subordinate-agent generator agent — are encapsulated as tools.
-The supervisor agent is responsible for task decomposition and tool dispatching. It splits the original problem into subtasks and first invokes the review agent. If they reach a consistent conclusion, the supervisor calls the subordinate-agent generator tool, which spawns dedicated subordinate agents to handle each corresponding subproblem. Meanwhile, the supervisor assigns available tools together with each dispatched task. Subordinate agents are not allowed to communicate with one another. Before distributing tasks, the supervisor will check whether required tools exist. If a tool is missing, it triggers the code agent to generate the tool, which is then tested inside a sandbox. Validated tools are stored under src\so_agent\tool_packages\generated_tools. Full details are documented in the markdown file.
-This is not my final design, and there are several pain points to address:
-The sandbox should block network access by default. However, tools written by the code agent may require internet connectivity. A whitelist mechanism will be needed, yet any network exception creates security trade-offs and eliminates absolute isolation guarantees.
-Dynamically generated tools should not be persisted directly into the permanent tool library. Instead, tool metadata and logic can be cached in Redis with a TTL (time-to-live) to reduce resource consumption. Ephemeral one-shot tools will be purged automatically upon expiration. Redis can also record invocation counts. Based on usage frequency, the system decides whether to persist the tool long-term, which helps reduce token overhead.
-For comprehensive evaluation, all test logs will be saved in a database such as MySQL with dedicated tables for metrics. Tracked data includes: how many subtasks a problem is split into, required tools, time spent on tool generation and sandbox testing, total problem-solving duration, the number of rounds of debate between the supervisor and review agent, and root causes for disagreements. These statistics will help refine prompts.
-Infinite loops must be prevented with fallback safeguards. My current logic includes a manual fallback path that remains unimplemented. I intend to keep the problem-solving workflow concise and capped at a maximum of 3 hierarchical layers.
-Currently, nearly all reasoning work is delegated to the LLM. This raises a question: do we need the underlying LLM to possess stronger general reasoning and problem-solving capabilities?
-Beyond system design, I am also reflecting on a fundamental question: is the core goal of artificial intelligence to build smoother, more convenient tools for humans, or to replace human labor outright?
+# SO-Agent
+
+A governed multi-agent execution runtime: a two-tier, star-topology multi-agent orchestration framework built on the [OpenAI Agents SDK](https://github.com/openai/openai-agents-python). The core design principle is **LLM-as-Thinker, Code-as-Decider** — the LLM understands goals, decomposes tasks, generates instructions, and analyzes content; all decisions such as state transitions, permission issuance, retry control, and execution scheduling are made by the deterministic code layer.
+
+> **Project status: experimental / research use.** Not production-ready; interfaces and behavior may change at any time. Test counts and capability claims reflect the current code snapshot and are not permanent guarantees.
+
+- Architecture document (English): [SO_Agent_Execution_Runtime.md](./SO_Agent_Execution_Runtime.md)
+- 中文架构文档：[多_Agent_框架.md](./多_Agent_框架.md)
+
+## Core Features (Implemented)
+
+All capabilities below are implemented in the current code and covered by **1209 tests (current snapshot)**:
+
+- **Four-quadrant task routing**: rule-based pre-check plus one lightweight LLM classification; tasks are dispatched along the complexity × duration quadrants to direct answer / deep reasoning / persistent task / full workflow paths. Classification failure conservatively degrades to the full workflow.
+- **Two-tier star architecture**: the Supervisor Agent exclusively holds exactly three tool entries (code_agent, subagent_creator, review_agent); subagents have no message channels or shared sessions — all communication is relayed by the Supervisor.
+- **Thin orchestrator + three coordinators**: WorkflowEngine keeps only the main loop and human escalation; planning (decomposition and plan review), execution (scheduling and failure escalation), and aggregation (synthesis and result review) belong to three coordinators exchanging state via a shared state object.
+- **13-phase shadow FSM**: a python-statemachine declarative state chart mirrors the authoritative task status; all legal transitions are declared explicitly, illegal ones are rejected and logged.
+- **Two-stage review**: plan review and result review both produce a structured ReviewDecision; `passed` is the only approval field and the gate is fail closed — an invalid contract or parse failure is conservatively treated as rejection; `suggestions` are non-blocking and never a rejection reason.
+- **Authorization proposal with deferred issuance and revoke-on-all-exits**: tool grants are issued by the code layer only after the plan review passes (proposal → grant); every exit — task completion, replacement, re-planning — revokes outstanding grants.
+- **Deterministic failure recovery**: FailureClassifier categorizes failures (low-trust agent text cannot forge system failure categories), failure fingerprints deduplicate retries (retries suppressed once the same-cause streak reaches the threshold), and RecoveryPolicy decides retry / repair / replacement / replanning per category; provider-type failures forbid replacement, and FORMAT failures allow exactly one contract repair before entering REPLAN.
+- **Replacement-chain depth 1 and bounded replanning**: up to 3 attempts per agent, the original subagent may request a replacement only once, replacement agents cannot request further replacements, and the Supervisor may revise the decomposition at most 3 times (with explicit `reuse_from` reuse of prior results) before entering the `human_required` state.
+- **Five-layer streaming timeouts and stop gate**: first-event / model-idle / tool-execution / per-agent total / pipeline deadline windows; the PipelineGate rejects every new action after deadline or cancellation and isolates late results.
+- **Tool timeout profiles**: standard tools, nested subagents, and the long-running code agent use dedicated tool-phase wait windows so long tasks are not killed prematurely by the generic window.
+- **Dynamic tool generation and MCP layer**: tools generated by code_agent must prove correctness via test_cases and pass per-case semantic verification in the sandbox before registration; the protocol layer provides an MCP server, client, and bidirectional adapters.
+- **Persistence and schema migration**: SQLite stores long-running tasks, execution records (Execution), and plan versions (PlanVersion); versioned sequential incremental migrations are idempotent, transactional, and fail closed on unknown higher schema versions.
+
+## Installation
+
+Requires Python 3.10+. All commands below are valid in Windows PowerShell (no `&&` separators).
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
+```
+
+## Key Configuration
+
+Keys are never committed to the repository. Two options (either one):
+
+1. **Environment variables**: set the variable referenced by each agent's `api_key_env`, for example:
+
+   ```powershell
+   $env:SO_AGENT_API_KEY = "sk-your-key"
+   ```
+
+2. **secrets.yaml** (project root, ignored by version control): `main.py` loads its key-value pairs into environment variables at startup.
+
+Connection settings live in `src/so_agent/api_config.yaml` and `src/so_agent/tool_packages/<agent>/api_config.yaml`. The recommended style is to declare `api_key_env` (the environment variable name); writing the key directly as `api_key` is kept only for backward compatibility and is discouraged. See the `api_config.yaml.example` files at each level.
+
+## Quick Start
+
+```powershell
+# One-shot task (the objective may also be piped in via stdin)
+.\.venv\Scripts\python.exe -m so_agent.main "Implement a CLI statistics tool for the target directory" --constraints "Standard library only" --acceptance-criteria "Provide a runnable self-verifying script"
+
+# Persistent task scheduler daemon (polls and executes due tasks in the background; no objective needed)
+.\.venv\Scripts\python.exe -m so_agent.main --daemon
+```
+
+Notes:
+
+- `--config <file>` overrides `Settings` defaults with a YAML / JSON file (e.g. `max_concurrency`, `model_timeout`);
+- Exit code is 0 when the task reaches the `completed` terminal state, 1 for other terminal states (`human_required` / `failed` / `cancelled`), and 2 for argument or configuration errors;
+- Standard output prints only the structured JSON result; run-status summaries go to standard error.
+
+## Running the Tests
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest
+```
+
+The suite currently collects **1209 tests (current snapshot)**, all using fake models with no real API consumption; real end-to-end tests require a key and are executed separately.
+
+## Key Default Settings (Verified Against Current Code)
+
+The values below are runtime time caps and governance parameters, overridable via environment variables (`SO_AGENT_` prefix), `.env`, or a `--config` file. They are **not** an implemented multi-dimensional budget system (budget and context governance are deferred — see below).
+
+| Parameter | Default | Description |
+| --- | --- | --- |
+| `max_model_turns` | 8 | Max model turns per agent run |
+| `model_timeout` | 45 s | Per model-call timeout (HTTP layer) |
+| `first_event_timeout` | 180 s | Streaming first-event window |
+| `model_idle_timeout` | 90 s | Model-phase idle window |
+| `tool_execution_timeout` | 180 s | Standard tool execution window |
+| `subagent_tool_execution_timeout` | 610 s | Nested-subagent tool window (derived by default = agent total + 10 s) |
+| `code_agent_tool_execution_timeout` | 610 s | Code-agent tool window (same derivation) |
+| `agent_total_timeout` | 600 s | Total budget per agent call |
+| `supervisor_total_timeout` | 900 s | Total budget per supervisor call |
+| `max_pipeline_timeout` | 2400 s | Pipeline deadline (graceful degradation on expiry) |
+| `max_dynamic_agents` | 8 | Max dynamically created subagents |
+| `max_concurrency` | 3 | Max concurrently executing subtasks |
+| `max_agent_attempts` | 3 | Max attempts per agent (actual count decided by the recovery policy) |
+| `max_replacement_requests` | 1 | Max replacement requests (replacement-chain depth 1) |
+| `max_replan_attempts` | 3 | Max decomposition revisions by the supervisor |
+| `sandbox_timeout` | 30 s | Sandbox per-command timeout |
+| `sandbox_output_limit` | 1 MiB | Sandbox output cap |
+| `scheduler_poll_interval` | 60 s | Daemon polling interval |
+| `task_store_path` | `sandbox/task_store.db` | SQLite task store path |
+
+## Capability Status and Roadmap
+
+Implementation status is strictly separated so that vision is never presented as existing capability.
+
+### Implemented
+
+Four-quadrant routing; thin WorkflowEngine and three coordinators; 13-phase shadow FSM; two-stage review (`passed` as the sole approval field + fail closed); authorization proposal with deferred issuance and revoke-on-all-exits; star communication isolation; explicit `reuse_from` reuse; five-layer streaming timeouts; PipelineGate; tool timeout profiles; schema migration; FailureClassifier; failure fingerprints and deduplication; RecoveryPolicy; provider no-replacement rule; FORMAT single bounded contract repair then REPLAN; low-trust agent text cannot forge system failures; SQLite persistence (tasks / Execution / PlanVersion); path-isolated SandboxRunner; MCP protocol layer; semantic-verified dynamic tool registration.
+
+### Deferred (Design Rationale Retained)
+
+- **Multi-dimensional budgets**: a token / cost / time budget system. The existing time caps (see the defaults table) and basic token usage records are single-dimension constraints, not a multi-dimensional budget.
+- **Context governance**: context compaction, pruning, and quota management for long tasks.
+- **Production container sandbox**: the current SandboxRunner performs path isolation only (see risk statement); container-level isolation (the earlier Docker / remote-execution idea) is deferred.
+
+### Planned (Not Implemented)
+
+- **Unified ModelGateway**: a single gateway layer for model access, quotas, and failover.
+- **Execution-level and parameter-level permission hardening**: current grants are tool-name granularity; finer per-parameter constraints are not yet implemented.
+- **Temporal PoC or migration**: feasibility validation of replacing in-process orchestration with Temporal.
+- **Durable auditing**: cross-task audit trail storage and querying.
+- **OpenTelemetry**: distributed tracing and observability integration.
+- Other retained future directions: TTL caching of tools with invocation-count-driven persistence thresholds (the earlier Redis idea, replaced today by explicit persistent scheduling), statistics database tables for analysis (the earlier MySQL idea, replaced today by SQLite execution records and local logs), dynamic agent templates and capability whitelists, and a web console with task visualization.
+
+## Risks and Limitations
+
+- **Experimental / research status**: the governance and recovery mechanisms target research and validation and are untested under production load.
+- **Streaming cancellation may be delayed underneath**: timeout and cancellation teardown depends on the underlying SDK's cancellation behavior; iterator close has a bounded grace period, and in extreme cases underlying cancellation may be delayed — late results are isolated by the stop gate, but prompt resource release is not guaranteed.
+- **The current sandbox is not a security boundary**: SandboxRunner isolates the working directory path only; it does not restrict network, CPU, memory, syscalls, or directory escape, and **must not be used to run untrusted code**.
+- **Human escalation is interface and state only**: the `human_required` terminal state produces a complete HumanEscalationRequest handover, but there is no human workstation, notification, or ticket write-back system.
+- **Budgets and context deferred**: while multi-dimensional budgets and context governance are deferred, cost and context control for long tasks relies on the time caps and bounded retry quotas above.
+
+## Documentation
+
+- [SO_Agent_Execution_Runtime.md](./SO_Agent_Execution_Runtime.md): English architecture document — original design rationale and actual evolution, layering, state model, data structures, permissions, configuration, and test plan.
+- [多_Agent_框架.md](./多_Agent_框架.md): Chinese architecture document (section-for-section and capability-status aligned with the English version).
+- Configuration examples: [src/so_agent/api_config.yaml.example](./src/so_agent/api_config.yaml.example) and `src/so_agent/tool_packages/<agent>/api_config.yaml.example`.

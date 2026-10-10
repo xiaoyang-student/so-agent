@@ -67,7 +67,11 @@ from so_agent.models import (
     TaskRequest,
     ToolGrant,
 )
-from so_agent.runtime.config_loader import AgentAPIConfig, load_agent_api_config
+from so_agent.runtime.config_loader import (
+    AgentAPIConfig,
+    load_agent_api_config,
+    resolve_model_http_timeout,
+)
 
 # ---------------------------------------------------------------------------
 # 包内路径（用 pathlib 定位同目录下的提示词与 API 配置）
@@ -82,7 +86,9 @@ AGENT_NAME = "review_agent"
 # 主管侧调用说明（同时用于 as_tool 入口与 MCP 暴露契约）
 _TOOL_DESCRIPTION = (
     "评审 Agent：对任务拆解计划、工具授权必要性、生成工具与执行结果做独立质检，"
-    "返回 ReviewDecision 结构的 JSON 结论（passed/issues/required_fixes/retry_target）。"
+    "返回 ReviewDecision 结构的 JSON 结论"
+    "（passed/issues/suggestions/required_fixes/retry_target；"
+    "passed=true 时 required_fixes 必须为空，非阻断建议写入 suggestions）。"
 )
 
 # 授权评审中视为“过于宽泛/高风险”的工具名（提示模型重点核验）
@@ -102,21 +108,39 @@ _EXTRA_INSTRUCTIONS = """
 - `tool_grants`：本次计划的工具授权列表（授权评审时提供，可为 null）；
 - `generated_tool`：待评审的生成工具清单（GeneratedToolManifest；工具评审时提供，可为 null）；
 - `execution_results`：全部子任务的执行结果列表（结果评审时提供，可为 null）；
+- `available_tools`：当前环境可用工具清单（计划评审时提供，可为 null）；
 - `plan_version`：当前计划版本号。
 
 ## 内部校验工具（自动检查，供结论参考）
 
 1. 计划评审：调用 `check_plan_completeness` 检查子任务完整性
-   （重复 ID、空字段、依赖缺失、自依赖、循环依赖）；
+   （重复 ID、空字段、依赖缺失、自依赖、循环依赖），并把 ReviewInput
+   的 `available_tools` 原样作为 `available_tools_json` 传入，核对
+   子任务声明的 allowed_tools 是否都在可用工具列表中；如果子任务依赖
+   的工具或运行环境不在可用范围内，应在 issues 中指出并建议替代方案
+   （待创建的动态工具属正常流程，不构成拒绝理由）；
 2. 授权评审：调用 `check_tool_necessity` 检查授权必要性与最小化
    （超额授权、未授权缺口、空授权、可疑宽泛工具）；
+   授权评审的通过/拒绝策略：
+   - 通过（passed=true）：主管分配工具合理且无超额授权，即使存在声明但尚未授权的工具
+     （under_granted），也应通过并在 issues 中提醒主管在执行前补发授权；
+   - 拒绝（passed=false）：仅当存在超额授权（over_granted）、可疑宽泛工具（suspicious_tools）、
+     或工具分配明显错误（如纯分析任务却声明了写入工具）时才拒绝；
+   - under_granted（声明但未授权）不构成拒绝理由：动态工具需在执行阶段创建后才能授权，
+     计划阶段无法预先签发，这是正常流程而非缺陷。
 3. 结果评审：调用 `check_result_correctness` 检查执行结果的失败项、
    证据完整性、产物路径是否越界；
-4. 生成工具评审（`tool_review`）：核验 `generated_tool` 候选的用途必要性、
-   名称规范（snake_case、不与既有工具重名）、MCP 契约完整性
-   （name/description/inputSchema 与实现入口一致）与安全边界
-   （不得引用其他 Agent、不得越出沙箱）；必要时结合 `check_tool_necessity`
-   核对声明与授权的对应关系。
+4. 生成工具评审（`tool_review`）的通过/拒绝策略：
+   - 通过（passed=true）：功能正确且安全即通过——用途必要、名称规范
+     （snake_case、不与既有工具重名）、MCP 契约完整（name/description/
+     inputSchema 与实现入口一致）、安全边界达标（不得引用其他 Agent、
+     不得越出沙箱）、入口 `run()` 返回值为 JSON 可序列化；
+   - `test_cases` / `expected_outputs` 覆盖不全（如缺少边界用例）仅在
+     issues 中提醒改进，不作为拒绝理由——注册前的沙箱验收会逐用例
+     比对正确答案兜底；必要时可结合 `check_tool_necessity` 核对声明
+     与授权的对应关系；
+   - 拒绝（passed=false）：仅当存在功能错误（实现与用途明显不符）、
+     安全风险、名称严重不规范或 MCP 契约与实现不符时才拒绝。
 
 自动检查结论必须纳入考量，但不得替代你的独立判断；
 自动检查未覆盖的语义问题（如验收标准覆盖度）仍需你逐条核对。
@@ -130,8 +154,9 @@ _EXTRA_INSTRUCTIONS = """
 {
   "stage": "plan_review 或 result_review",
   "passed": true,
-  "issues": ["发现的问题（无则空数组）"],
-  "required_fixes": ["必须修复项（无则空数组）"],
+  "issues": ["发现的问题描述（无则空数组）"],
+  "suggestions": ["非阻断的改进建议（无则空数组）"],
+  "required_fixes": ["阻断性必须修复项（passed=false 时必填至少一条）"],
   "retry_target": "需要重试的 subtask_id 或 agent_id；无需重试则为 null",
   "summary": "结论摘要（含逐条验收标准核对结论）"
 }
@@ -141,8 +166,14 @@ _EXTRA_INSTRUCTIONS = """
   当本次输入 `stage` 为 `authorization_review` 或 `tool_review` 时，输出 `stage`
   必须填 `plan_review`，并在 `summary` 中注明“本次为授权最小化评审”或
   “本次为生成工具评审”；
-- `passed` 为 true 仅当不存在 `required_fixes`；
-- 每个 `required_fixes` 条目应指向具体问题并给出可操作建议；
+- 字段契约（硬约束，违反将导致结论被判定为无效）：
+  - `passed` 是唯一放行字段，必须显式输出 true/false；
+  - `passed=true` 时 `required_fixes` 必须为空数组 `[]`；
+  - `passed=false` 时 `required_fixes` 必须至少包含一条修复项；
+  - `issues` 只写问题描述；非阻断的改进建议一律写入 `suggestions`，
+    不得放入 `required_fixes`；
+  - `suggestions` 非空不影响放行（仅提示性建议）；
+- 每个 `required_fixes` 条目应指向具体阻断问题并给出可操作建议；
 - 检查工具的 JSON 返回值仅作证据，结论必须独立作出且与证据一致。
 """
 
@@ -174,6 +205,10 @@ class ReviewInput(BaseModel):
     )
     execution_results: list[ExecutionResult] | None = Field(
         default=None, description="全部子任务的执行结果列表（结果评审时提供）"
+    )
+    available_tools: list[str] | None = Field(
+        default=None,
+        description="当前环境可用工具清单（计划评审时提供，供核对子任务声明工具是否越界）",
     )
     plan_version: int = Field(default=1, description="当前计划版本号")
 
@@ -239,7 +274,7 @@ def _build_chat_model(config: AgentAPIConfig) -> Model:
     client = AsyncOpenAI(
         api_key=api_key,
         base_url=config.base_url or None,
-        timeout=config.timeout,
+        timeout=resolve_model_http_timeout(config),
         max_retries=config.retry,
     )
     return OpenAIChatCompletionsModel(model=config.model, openai_client=client)
@@ -325,6 +360,23 @@ def _parse_criteria(value: str) -> list[str]:
     return [str(data)]
 
 
+def _parse_available_tools(value: str) -> list[str] | None:
+    """解析可用工具清单 JSON（字符串数组；空/非法输入或空列表返回 None，
+    表示未提供，调用方据此跳过工具越界检查）。"""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        data = json.loads(value)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(data, dict):
+        data = data.get("available_tools", data.get("tools", []))
+    if not isinstance(data, list):
+        return None
+    items = [str(item).strip() for item in data if str(item).strip()]
+    return items if items else None
+
+
 def _detect_cycles(specs: list[SubtaskSpec]) -> list[str]:
     """用 Kahn 算法检测依赖环，返回无法完成拓扑排序的 subtask_id（含环成员）。"""
     ids = [spec.subtask_id for spec in specs]
@@ -375,18 +427,27 @@ def build_review_tools(
     sandbox_root = _sandbox_root(resolved_context)
 
     @function_tool
-    def check_plan_completeness(ctx: RunContextWrapper[Any], subtasks_json: str) -> str:
-        """检查任务拆解的完整性：重复 ID、空字段、依赖缺失、自依赖与循环依赖。
+    def check_plan_completeness(
+        ctx: RunContextWrapper[Any],
+        subtasks_json: str,
+        available_tools_json: str = "[]",
+    ) -> str:
+        """检查任务拆解的完整性：重复 ID、空字段、依赖缺失、自依赖与循环依赖，
+        以及子任务声明的 allowed_tools 是否都在可用工具列表中。
 
         Args:
             subtasks_json: 子任务规格列表的 JSON 文本（SubtaskSpec 数组，或
                 含 subtasks 数组的对象）。
+            available_tools_json: 当前环境可用工具清单的 JSON 文本（字符串
+                数组，取自 ReviewInput.available_tools）；未提供或为空时
+                跳过工具越界检查。
 
         Returns:
             JSON 字符串：包含 ``duplicate_ids`` / ``empty_fields`` /
             ``self_dependencies`` / ``missing_dependencies`` / ``cyclic_ids``
-            / ``passed``（无任何问题才为 true）与 ``notes``；输入非法时返回
-            ``{"status": "error", "error"}``。
+            / ``out_of_scope_tools``（声明但不在可用工具列表中的工具，仅
+            提醒不构成失败）/ ``passed``（结构完整性无问题才为 true）与
+            ``notes``；输入非法时返回 ``{"status": "error", "error"}``。
         """
         try:
             specs = _parse_subtask_list(subtasks_json)
@@ -425,6 +486,16 @@ def build_review_tools(
         ]
         cyclic_ids = _detect_cycles(specs)
 
+        # 工具越界检查（仅提醒不构成失败）：子任务声明的 allowed_tools
+        # 是否都在可用工具列表中（available_tools 未提供时跳过）
+        available_tools = _parse_available_tools(available_tools_json)
+        out_of_scope_tools: list[str] = []
+        if available_tools is not None:
+            available_set = set(available_tools)
+            out_of_scope_tools = sorted(
+                tool for tool in _flat_tools(specs) if tool not in available_set
+            )
+
         notes: list[str] = []
         if not specs:
             notes.append("子任务清单为空：计划评审不可能通过，请要求主 Agent 重新拆解。")
@@ -432,6 +503,11 @@ def build_review_tools(
             notes.append("存在依赖不存在的子任务：请核对 subtask_id 拼写或补充缺失子任务。")
         if cyclic_ids:
             notes.append("依赖图存在环：必须调整依赖关系后才能执行。")
+        if out_of_scope_tools:
+            notes.append(
+                "存在不在可用工具列表中的声明工具：若为待创建的动态工具属正常流程；"
+                "若运行环境无法提供，请在 issues 中指出并建议替代方案。"
+            )
         passed = not (
             duplicates or empty_fields or self_dependencies or missing_dependencies or cyclic_ids
         )
@@ -447,6 +523,7 @@ def build_review_tools(
                 "self_dependencies": self_dependencies,
                 "missing_dependencies": missing_dependencies,
                 "cyclic_ids": cyclic_ids,
+                "out_of_scope_tools": out_of_scope_tools,
                 "passed": passed,
                 "notes": notes,
             }
@@ -486,7 +563,7 @@ def build_review_tools(
         if over_granted:
             notes.append("存在超出子任务声明的授权工具：须核验是否为必要最小化，否则应收紧授权。")
         if under_granted:
-            notes.append("存在声明但未授权的工具：相关子任务可能因缺少工具而失败，请补充授权或调整声明。")
+            notes.append("提示：存在声明但尚未授权的工具，主管应在执行前补发授权；若为动态工具，将在执行阶段创建后自动授权。")
         if empty_grants:
             notes.append("存在空授权条目：空授权不产生任何放行能力，应删除或补全。")
         if suspicious:

@@ -48,6 +48,14 @@ class AgentAPIConfig(BaseModel):
     base_url: str | None = None                     # None 表示使用 provider 默认地址
     timeout: float = 60.0                           # 单次请求超时（秒）
     retry: int = 2                                  # 失败自动重试次数
+    # 模型 HTTP 客户端的分维度超时（任务 45，全部可选、向后兼容）：
+    # 任一维度显式配置时，resolve_model_http_timeout 会构造
+    # openai.Timeout（总预算仍取 ``timeout``）；全部未配置时保持旧
+    # 行为（单一总超时），既有 api_config.yaml 无需任何修改。
+    connect_timeout: float | None = None            # TCP 连接建立超时（秒）
+    read_timeout: float | None = None               # 读取超时（两次读之间的间隔上限，非总时长）
+    write_timeout: float | None = None              # 写入超时（秒）
+    pool_timeout: float | None = None               # 连接池获取超时（秒）
     api_key: str | None = Field(default=None, exclude=True)  # 直接密钥值（优先）；序列化时排除
     api_key_env: str | None = None                  # 密钥所在的环境变量名（向后兼容回退）
 
@@ -85,6 +93,62 @@ SECRET_FIELDS: tuple[str, ...] = ("api_key", "api_key_env")
 
 # 工具包目录下的固定配置文件名
 DEFAULT_CONFIG_FILENAME = "api_config.yaml"
+
+
+def resolve_model_http_timeout(config: "AgentAPIConfig") -> Any:
+    """把 AgentAPIConfig 解析为模型 HTTP 客户端的 ``timeout`` 参数。
+
+    任务 45 的可测试 adapter：
+
+    - 四个分维度（connect / read / write / pool）均未配置时，返回
+      ``float(config.timeout)``——与旧行为完全一致（完全向后兼容）；
+    - 任一维度显式配置时，返回 ``openai.Timeout(timeout, **已配置维度)``
+      （未配置的维度回退到总预算值；openai 3.26.0 的 ``Timeout``
+      构造器不支持部分维度缺省时仅设置该维度，总预算位置参数必须
+      显式给出）。
+
+    边界事实（经 SDK 源码核查，不凭记忆假设）：
+
+    - OpenAI Agents SDK 0.22.3 的 ``OpenAIChatCompletionsModel`` 构造
+      ``chat.completions.create`` 调用参数时不传递
+      ``ModelSettings.timeout``（仅透传 temperature/top_p 等），因此
+      超时只能在 ``AsyncOpenAI`` 客户端级别注入，本函数即该注入点；
+    - httpx 的 read timeout 是单次 I/O 操作（流式下为 chunk 间隔）
+      的上限而非整次请求总时长；总时长预算由上层兜底
+      （run_agent_streamed 的 agent_total 与 pipeline deadline），
+      客户端维度超时只负责快速失败，不承担总预算职责。
+
+    Raises:
+        ConfigLoadError: 任一分维度配置为非正数时（fail fast，避免
+            非法配置静默生效）。
+    """
+    dimensions: dict[str, float | None] = {
+        "connect": config.connect_timeout,
+        "read": config.read_timeout,
+        "write": config.write_timeout,
+        "pool": config.pool_timeout,
+    }
+    configured = {
+        name: float(value)
+        for name, value in dimensions.items()
+        if value is not None
+    }
+    invalid = {name: value for name, value in configured.items() if value <= 0.0}
+    if invalid:
+        raise ConfigLoadError(
+            f"模型 HTTP 分维度超时必须为正数：{invalid}"
+            f"（provider={config.provider!r}）"
+        )
+    if not configured:
+        return float(config.timeout)
+    try:
+        from openai import Timeout
+    except ImportError as exc:  # pragma: no cover - openai 为硬依赖
+        raise ConfigLoadError(
+            "openai 包不可用，无法构造分维度超时（Timeout）；"
+            "请安装 openai 或移除 connect/read/write/pool_timeout 配置"
+        ) from exc
+    return Timeout(float(config.timeout), **configured)
 
 
 def load_agent_api_config(

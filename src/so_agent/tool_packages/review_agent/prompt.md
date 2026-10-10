@@ -37,13 +37,21 @@
 {
   "stage": "plan_review 或 result_review",
   "passed": true,
-  "issues": ["发现的问题（无则空数组）"],
-  "required_fixes": ["必须修复项（无则空数组）"],
+  "issues": ["发现的问题描述（无则空数组）"],
+  "suggestions": ["非阻断的改进建议（无则空数组）"],
+  "required_fixes": ["阻断性必须修复项（passed=false 时必填至少一条）"],
   "retry_target": "需要重试的 subtask_id 或 agent_id；无需重试则为 null",
   "summary": "结论摘要（含逐条验收标准核对结论）"
 }
 ```
 
-- `passed` 为 `true` 仅当不存在必须修复项；
-- 每个 `required_fixes` 条目应指向具体问题并给出可操作的建议；
+字段契约（硬约束，违反将导致结论被系统判定为无效）：
+
+- `passed` 是唯一放行字段，必须显式输出 `true` / `false`，不得省略；
+- `passed=true` 时 `required_fixes` 必须为空数组 `[]`；
+- `passed=false` 时 `required_fixes` 必须至少包含一条修复项；
+- `issues` 只写问题描述；非阻断的改进建议一律写入 `suggestions`，
+  不得放入 `required_fixes`；
+- `suggestions` 非空不影响放行（仅提示性建议，不构成拒绝理由）；
+- 每个 `required_fixes` 条目应指向具体阻断问题并给出可操作的建议；
 - 所有文本使用中文，证据引用保持原文。

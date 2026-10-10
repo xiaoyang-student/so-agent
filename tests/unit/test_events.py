@@ -26,8 +26,15 @@ def context(tmp_path):
 
 
 class TestEventTypesRegistry:
-    def test_fourteen_registered_types(self):
-        assert len(ALL_EVENT_TYPES) == 14
+    def test_registered_types_count(self):
+        # 任务 32 新增 review_contract_repair / review_contract_error；
+        # 任务 33 新增 timeout_audit（分阶段流式超时审计）；
+        # 任务 34 新增 replacement_executing / replacement_completed /
+        # replacement_failed（替代生命周期真实时点事件）；
+        # 任务 35 新增 result_reused / reuse_rejected（显式结果复用）；
+        # 任务 46 新增 failure_classified / recovery_decided /
+        # retry_suppressed（确定性失败恢复审计）
+        assert len(ALL_EVENT_TYPES) == 29
 
     def test_expected_type_names(self):
         expected = {
@@ -36,15 +43,30 @@ class TestEventTypesRegistry:
             "task_dispatched",
             "tool_granted",
             "tool_revoked",
+            "tool_denied",
             "tool_called",
             "agent_created",
             "agent_released",
             "replacement_requested",
+            "replacement_executing",
+            "replacement_completed",
+            "replacement_failed",
             "decomposition_issue",
             "replan",
             "human_escalation",
             "message_routed",
             "message_rejected",
+            "token_usage",
+            "review_parse_error",
+            "review_agent_output",
+            "review_contract_repair",
+            "review_contract_error",
+            "timeout_audit",
+            "result_reused",
+            "reuse_rejected",
+            "failure_classified",
+            "recovery_decided",
+            "retry_suppressed",
         }
         assert set(ALL_EVENT_TYPES) == expected
 
@@ -319,3 +341,31 @@ class TestTimestampPersistence:
         events = logger.events
         assert events[0]["timestamp"] == late.isoformat()
         assert events[1]["timestamp"] == early.isoformat()
+
+
+class TestCircularReference:
+    def test_self_referencing_dict_does_not_recurse(self):
+        logger = EventLogger()
+        payload: dict = {"name": "loop"}
+        payload["self"] = payload  # 自引用
+        record = logger.log_event(EVENT_TASK_CREATED, payload)  # 不抛 RecursionError
+        assert record["payload"]["self"] == "<circular-reference>"
+
+    def test_mutual_container_reference_serializable(self):
+        logger = EventLogger()
+        a: list = []
+        b: list = [a]
+        a.append(b)  # 互相引用
+        record = logger.log_event(EVENT_TASK_CREATED, {"pair": a})
+        json.dumps(record["payload"], ensure_ascii=False)  # 可序列化即通过
+
+
+class TestContextMaxEvents:
+    def test_context_event_log_also_truncated(self, context):
+        # 修复：context.event_log 镜像同步受 max_events 裁剪，避免无界增长
+        logger = EventLogger(context=context, max_events=2)
+        for index in range(4):
+            logger.log_event(EVENT_TASK_CREATED, {"index": index})
+        assert len(logger.events) == 2
+        assert len(context.event_log) == 2
+        assert context.event_log[-1]["payload"]["index"] == 3

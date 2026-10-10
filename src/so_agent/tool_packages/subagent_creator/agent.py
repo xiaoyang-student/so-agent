@@ -11,6 +11,11 @@ Creator）”——在不预先开发、不重启系统的前提下，按需动�
 - 绑定两个核心工具：``create_subagent``（按 SubtaskSpec + ToolGrant 动态
   构造并登记子 Agent）与 ``execute_subagent``（执行已登记子 Agent 并回收
   ExecutionResult）；两个工具返回值统一为 JSON 字符串；
+- 工具权限双重防护：构造时（create_subagent）按 allowed_tools ∩ 工具池
+  过滤注入（第一层）；提供 PermissionGateway 时每个注入工具再经
+  ``_wrap_tool_with_permission_check`` 包裹，在每次工具调用的
+  ``on_invoke_tool`` 回调内执行 ``verify_grant`` 运行时校验（第二层，
+  授权撤销/过期后立即生效）；
 - Agent 输出为纯文本 JSON（``output_type=None``，不依赖 SDK 结构化输出：
   千问等 OpenAI 兼容接口会忽略 ``response_format=json_schema`` 并把
   JSON 包裹在 Markdown 代码围栏中返回，故由调用方剥离围栏后按
@@ -41,7 +46,7 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -66,11 +71,18 @@ from so_agent.mcp.adapter import agent_to_mcp_server, mcp_server_to_agent_tool
 from so_agent.mcp.protocol import MCPToolSchema
 from so_agent.mcp.server import MCPToolServer
 from so_agent.models import AgentRecord, ExecutionResult, SubtaskSpec, ToolGrant
-from so_agent.runtime.config_loader import AgentAPIConfig, load_agent_api_config
+from so_agent.runtime.config_loader import (
+    AgentAPIConfig,
+    load_agent_api_config,
+    resolve_model_http_timeout,
+)
+from so_agent.runtime.events import EventLogger
+from so_agent.runtime.permissions import PermissionGateway
 from so_agent.runtime.registry import AgentRegistry, AgentRegistryError
 from so_agent.runtime.sandbox import SandboxRunner
 from so_agent.runtime.tool_registry import ToolRegistry
 from so_agent.tool_packages.code_agent.agent import build_code_tools
+from so_agent.workflow_support import make_tool_timeout_resolver, run_agent_streamed
 
 # ---------------------------------------------------------------------------
 # 包内路径（用 pathlib 定位同目录下的提示词与 API 配置）
@@ -106,7 +118,9 @@ _EXTRA_INSTRUCTIONS = """
 
    - `subtask_spec_json` 为 SubtaskSpec 的 JSON 文本；
    - `tool_grant_json` 为 ToolGrant 的 JSON 文本；仅其 `allowed_tools` 中
-     且在动态工具池内的工具会被注入；
+     且在动态工具池内的工具会被注入；启用运行时校验时，注入工具
+     在每次调用时还会向授权网关复核（授权撤销/过期后调用即被拦截
+     并返回错误 JSON）；
    - 返回 AgentRecord 的 JSON（附注入/被忽略的工具清单）。
 
 2. 随后对每个已创建 Agent 调用 `execute_subagent(agent_id, input_data)`：
@@ -222,7 +236,7 @@ def _build_chat_model(config: AgentAPIConfig) -> Model:
     client = AsyncOpenAI(
         api_key=api_key,
         base_url=config.base_url or None,
-        timeout=config.timeout,
+        timeout=resolve_model_http_timeout(config),
         max_retries=config.retry,
     )
     return OpenAIChatCompletionsModel(model=config.model, openai_client=client)
@@ -314,7 +328,12 @@ def _detect_replacement_of(
 
 
 def _compose_dynamic_instructions(spec: SubtaskSpec, injected_tools: list[str]) -> str:
-    """为动态子 Agent 组装专用系统提示词（含权限与输出纪律）。"""
+    """为动态子 Agent 组装专用系统提示词（含权限与输出纪律）。
+
+    输出契约与 ToolResponse 统一信封对齐：success / output / error /
+    artifacts / metadata 语义不变，另加 ExecutionResult 扩展字段
+    subtask_id / evidence（duration 可选——由调用方计时时无需模型填写）。
+    """
     tool_text = "、".join(injected_tools) if injected_tools else "（无工具授权）"
     return (
         "你是由子 Agent 创建器按需动态构造的专用子 Agent，只对下述子任务负责。\n\n"
@@ -330,7 +349,28 @@ def _compose_dynamic_instructions(spec: SubtaskSpec, injected_tools: list[str]) 
         "3. 不得访问项目沙箱目录之外的路径；所有证据必须真实可复核；\n"
         f"4. 最终输出必须是 ExecutionResult 结构的纯 JSON 文本（subtask_id 固定填 "
         f"\"{spec.subtask_id}\"）——不包裹 Markdown 代码围栏，不附加解释性文字，"
-        "禁止自由文本。"
+        "禁止自由文本。\n"
+        "\n"
+        "你的最终输出必须严格为以下 JSON 格式（统一 ToolResponse 信封字段，"
+        "不要包裹 Markdown 代码围栏）：\n"
+        "{\n"
+        "  \"subtask_id\": \"<当前子任务ID，即上面指定的 subtask_id>\",\n"
+        "  \"success\": true,\n"
+        "  \"output\": \"<你的完整分析/执行结果，作为字符串>\",\n"
+        "  \"evidence\": [\"相关证据（可选）\"],\n"
+        "  \"artifacts\": [\"产出文件路径（可选）\"],\n"
+        "  \"error\": null,\n"
+        "  \"metadata\": {}\n"
+        "}\n"
+        "\n"
+        "字段语义（与 ToolResponse 信封完全一致）：\n"
+        "- success：执行是否成功；失败时将 success 设为 false 并在 error 字段说明原因；\n"
+        "- output：主要产出，必须是字符串类型；如果你的结果是 JSON 对象，"
+        "请将其序列化为字符串放入 output；\n"
+        "- error：失败时的错误描述，成功时为 null；\n"
+        "- artifacts：产出的文件路径列表（通常为沙箱内的产物）；\n"
+        "- evidence：支撑结论的证据列表（命令输出、日志片段等）；\n"
+        "- metadata：扩展元数据对象（如耗时、统计信息等），无内容时填空对象 {}。"
     )
 
 
@@ -347,11 +387,14 @@ def _coerce_execution_result(output: Any, fallback_subtask_id: str) -> Execution
         try:
             result = ExecutionResult.model_validate(output)
         except ValidationError:
+            # 降级：子 Agent 产出了有效 JSON 但不是 ExecutionResult 格式，
+            # 将其整体作为 output 字段包裹进 ExecutionResult（避免无效重试）
             result = ExecutionResult(
                 subtask_id=fallback_subtask_id,
-                success=False,
-                output=str(output),
-                error="子 Agent 输出无法解析为 ExecutionResult 结构",
+                success=True,
+                output=json.dumps(output, ensure_ascii=False, default=str),
+                evidence=[],
+                artifacts=[],
             )
     elif isinstance(output, str):
         # 纯文本返回：剥离 ```json 围栏后提取 JSON 对象再校验
@@ -359,12 +402,24 @@ def _coerce_execution_result(output: Any, fallback_subtask_id: str) -> Execution
         try:
             result = ExecutionResult.model_validate(obj if obj is not None else output)
         except ValidationError:
-            result = ExecutionResult(
-                subtask_id=fallback_subtask_id,
-                success=False,
-                output=output,
-                error="子 Agent 未返回 ExecutionResult 结构化输出",
-            )
+            if obj is not None:
+                # 降级：剥离围栏后得到了有效 JSON 但不是 ExecutionResult 格式，
+                # 将其整体作为 output 字段包裹进 ExecutionResult（避免无效重试）
+                result = ExecutionResult(
+                    subtask_id=fallback_subtask_id,
+                    success=True,
+                    output=json.dumps(obj, ensure_ascii=False, default=str),
+                    evidence=[],
+                    artifacts=[],
+                )
+            else:
+                # 纯自由文本（无可提取 JSON）：保留原文并判失败
+                result = ExecutionResult(
+                    subtask_id=fallback_subtask_id,
+                    success=False,
+                    output=output,
+                    error="子 Agent 未返回 ExecutionResult 结构化输出",
+                )
     else:
         result = ExecutionResult(
             subtask_id=fallback_subtask_id,
@@ -375,6 +430,89 @@ def _coerce_execution_result(output: Any, fallback_subtask_id: str) -> Execution
     if not result.subtask_id:
         result.subtask_id = fallback_subtask_id
     return result
+
+
+def _wrap_tool_with_permission_check(
+    tool: FunctionTool,
+    gateway: PermissionGateway,
+    subtask_id: str,
+    *,
+    agent_id: str,
+    task_id: str,
+    grant_id: str | None = None,
+) -> FunctionTool:
+    """包裹 FunctionTool，在每次调用前执行运行时权限校验。
+
+    双重防护的第二层：构造时（create_subagent）已按 allowed_tools 过滤注入；
+    本包裹在工具真正被调用的时刻再向 PermissionGateway 校验一次，授权
+    被撤销或过期后立即失效（不依赖重新构造 Agent）。
+
+    拦截机制：OpenAI Agents SDK 的 ``FunctionTool`` 为 dataclass，
+    ``on_invoke_tool`` 是每次工具调用的唯一入口回调；因此用
+    ``dataclasses.replace`` 生成保留全部元数据（name / description /
+    params_json_schema / strict_json_schema 等）的副本，仅替换
+    ``on_invoke_tool`` 为校验前置的守卫回调。
+
+    校验身份说明：``verify_grant(agent_id, tool_name, task_id)`` 以授权
+    凭证（ToolGrant）登记的身份为准——即规划阶段按子任务槽位签发的
+    ``grant.agent_id``（形如 ``{task_id}:{subtask_id}:grant-slot``）与
+    ``grant.task_id``；动态子 Agent 自身的 agent_id
+    （``...dynamic-{hex}``）不是网关登记的授权主体，不参与校验。
+
+    grant_id 绑定校验（防伪造第三道）：提供 ``grant_id`` 时，在三元组
+    校验通过后额外把网关登记记录（``get_grant(grant_id)``）与本次调用
+    逐一比对——grant 存在、未撤销、agent_id/task_id 与凭证一致、
+    tool_name 在其白名单内。传入的 grant JSON 在到达本工具前可能被
+    主管模型转写（字段被篓改/拼接他单授权），绑定校验确保“凭证内容”
+    与“网关登记事实”一致，凭证字段被篓改后即使三元组侥幸匹配也会被
+    拦截；``grant_id`` 为 None 时保持旧行为（仅三元组校验，向后兼容）。
+
+    Args:
+        tool: 待包裹的原始 FunctionTool（不会被修改，返回新副本）。
+        gateway: 工具授权网关（运行时校验的权威判定者）。
+        subtask_id: 所属子任务编号（用于错误消息诊断）。
+        agent_id: 授权凭证登记的调用者身份（ToolGrant.agent_id）。
+        task_id: 授权凭证绑定的任务编号（ToolGrant.task_id）。
+        grant_id: 授权凭证编号；提供时追加网关登记记录绑定比对，None 时
+            跳过绑定校验（向后兼容）。
+
+    Returns:
+        新的 FunctionTool：校验通过则透传原始工具结果；校验失败返回
+        明确的错误 JSON（不执行原始工具），由子 Agent 模型可见并停止重试。
+    """
+    original_invoke = tool.on_invoke_tool
+    tool_name = tool.name
+
+    async def _guarded_invoke(
+        ctx: RunContextWrapper[Any], args_json: str
+    ) -> Any:
+        if not gateway.verify_grant(agent_id, tool_name, task_id):
+            return _error(
+                "工具调用被运行时权限校验拦截："
+                f"tool={tool_name}, subtask_id={subtask_id}, "
+                f"agent_id={agent_id}, task_id={task_id} —— 该授权不存在、"
+                "已撤销或已过期，本次调用未执行。请勿重复尝试该工具；"
+                "如确有必要请在最终输出中说明权限缺口。"
+            )
+        if grant_id is not None:
+            grant = gateway.get_grant(grant_id)
+            if (
+                grant is None
+                or grant.revoked
+                or grant.agent_id != agent_id
+                or grant.task_id != task_id
+                or tool_name not in grant.allowed_tools
+            ):
+                return _error(
+                    "工具调用被 grant_id 绑定校验拦截："
+                    f"grant_id={grant_id}, tool={tool_name}, "
+                    f"subtask_id={subtask_id} —— 授权凭证与网关登记记录"
+                    "不一致（凭证不存在、已撤销、主体不符或工具越权），"
+                    "本次调用未执行。请勿重复尝试该工具。"
+                )
+        return await original_invoke(ctx, args_json)
+
+    return replace(tool, on_invoke_tool=_guarded_invoke)
 
 
 # ---------------------------------------------------------------------------
@@ -388,6 +526,7 @@ def build_creator_tools(
     sandbox_runner: SandboxRunner | None = None,
     subagent_model: str | Model | None = None,
     tool_registry: ToolRegistry | None = None,
+    gateway: PermissionGateway | None = None,
 ) -> dict[str, FunctionTool]:
     """构造子 Agent 创建器的全部内部工具（以工具名索引的字典）。
 
@@ -406,6 +545,9 @@ def build_creator_tools(
         tool_registry: 工具注册表；提供时把其中已审批的动态生成工具
             （经 MCP Server 反向包装为 FunctionTool）并入动态工具池，
             使子 Agent 可按授权使用新生成的专用工具。
+        gateway: 工具授权网关；提供时对注入子 Agent 的每个工具追加
+            运行时校验包裹（verify_grant），形成“构造时注入 + 运行时
+            校验”双重防护；未提供时仅保留构造时过滤（向后兼容）。
 
     Returns:
         ``{工具名: FunctionTool}``，包含 create_subagent / execute_subagent。
@@ -437,6 +579,11 @@ def build_creator_tools(
             tool_pool[name] = mcp_server_to_agent_tool(server, name)
 
     state = _CreatorState()
+    # 超时审计事件通道（任务 33）：流式超时发生时写入 timeout_audit，
+    # 事件同步镜像到共享上下文的 event_log
+    audit_events = EventLogger(context=resolved_context)
+    # 运行时权限校验网关（None 表示关闭第二层防护，仅保留构造时过滤）
+    resolved_gateway = gateway
 
     @function_tool
     def create_subagent(
@@ -450,6 +597,10 @@ def build_creator_tools(
         工具池内的工具；不注入任何其他 Agent 的引用或通信能力。若该子任务在
         注册表中已有失败记录（或 SubtaskSpec 载荷显式带 ``replacement_of``），
         则本次创建视为替代 Agent：can_request_replacement 固定为 false。
+
+        启用运行时校验（装配时提供了 PermissionGateway）时，注入的工具会在
+        每次被调用的时刻向授权网关复核：授权被撤销或过期后调用立即被拦截
+        并返回错误 JSON（不执行原工具），与构造时过滤形成双重防护。
 
         Args:
             subtask_spec_json: SubtaskSpec 的 JSON 文本（可附带 replacement_of 字段）。
@@ -475,6 +626,25 @@ def build_creator_tools(
         injected_names = [name for name in grant.allowed_tools if name in tool_pool]
         ignored_names = [name for name in grant.allowed_tools if name not in tool_pool]
         injected_tools = [tool_pool[name] for name in injected_names]
+
+        # 2.5) 运行时权限包裹（双重防护第二层 + grant_id 绑定校验）：注入的
+        #      每个工具都经 PermissionGateway.verify_grant 前置校验，授权
+        #      撤销/过期后立即生效；同时把本凭证的 grant_id 传入包裹，
+        #      运行时比对网关登记记录，防止凭证字段在传递链路中被篓改。
+        #      以授权凭证登记的身份（grant.agent_id / grant.task_id）
+        #      为校验主体，与规划阶段槽位授权保持同一登记链。
+        if resolved_gateway is not None and injected_tools:
+            injected_tools = [
+                _wrap_tool_with_permission_check(
+                    tool,
+                    resolved_gateway,
+                    spec.subtask_id,
+                    agent_id=grant.agent_id,
+                    task_id=grant.task_id,
+                    grant_id=grant.grant_id,
+                )
+                for tool in injected_tools
+            ]
 
         # 3) 替代判定与替换权限
         replacement_of = _detect_replacement_of(
@@ -554,18 +724,41 @@ def build_creator_tools(
 
         fallback_subtask_id = _subtask_id_from_agent_id(agent_id)
         prompt = _normalize_subagent_input(input_data)
-        timeout = float(resolved_settings.model_timeout) * float(
-            resolved_settings.max_model_turns
-        )
+        # 分阶段流式超时（任务 33）：首事件 / 模型空闲 / 工具执行三类
+        # 阶段窗口 + agent_total_timeout 绝对总预算；流式执行下只要
+        # SDK 原生事件持续产出就不会被空闲超时误杀，阶段窗口内无事件
+        # 或总预算耗尽才终止
+        timeout = float(resolved_settings.agent_total_timeout)
 
         try:
-            run_result = await asyncio.wait_for(
-                Runner.run(
-                    agent_instance,
-                    input=prompt,
-                    max_turns=resolved_settings.max_model_turns,
+            run_result = await run_agent_streamed(
+                agent_instance,
+                input=prompt,
+                max_turns=int(resolved_settings.max_model_turns),
+                first_event_timeout=float(
+                    resolved_settings.first_event_timeout
                 ),
-                timeout=timeout,
+                model_idle_timeout=float(
+                    resolved_settings.model_idle_timeout
+                ),
+                tool_execution_timeout=float(
+                    resolved_settings.tool_execution_timeout
+                ),
+                agent_total_timeout=timeout,
+                # 工具窗口按 profile 解析（任务 45）：code_agent / 嵌套
+                # 子 Agent / sandbox 使用长窗口（不受普通 180s 限制），
+                # 仍受上方 agent_total_timeout 绝对总预算封顶
+                tool_timeout_resolver=make_tool_timeout_resolver(
+                    resolved_settings, tool_registry
+                ),
+                runner=Runner,
+                events=audit_events,
+                audit_context={
+                    "agent": "subagent",
+                    "task_id": record.parent_task_id,
+                    "agent_id": agent_id,
+                    "subtask_id": fallback_subtask_id,
+                },
             )
         except asyncio.TimeoutError:
             execution = ExecutionResult(
@@ -621,6 +814,7 @@ def create_subagent_creator(
     registry: AgentRegistry | None = None,
     sandbox_runner: SandboxRunner | None = None,
     tool_registry: ToolRegistry | None = None,
+    gateway: PermissionGateway | None = None,
 ) -> Agent[Any]:
     """构造配置完毕的子 Agent 创建器（SDK Agent 实例）。
 
@@ -636,6 +830,9 @@ def create_subagent_creator(
             context/settings 新建。
         tool_registry: 工具注册表；提供时把已审批的生成工具并入
             动态子 Agent 可注入工具池。
+        gateway: 工具授权网关；提供时对注入子 Agent 的工具追加运行时
+            校验（verify_grant），与工作流共享同一网关实例以复用
+            规划阶段签发的槽位授权。
 
     Returns:
         ``Agent`` 实例：name="subagent_creator"，instructions 取自 prompt.md，
@@ -653,6 +850,7 @@ def create_subagent_creator(
         sandbox_runner=sandbox_runner,
         subagent_model=resolved_model,
         tool_registry=tool_registry,
+        gateway=gateway,
     )
     return Agent(
         name=AGENT_NAME,
@@ -673,6 +871,7 @@ def get_subagent_creator_as_tool(
     registry: AgentRegistry | None = None,
     sandbox_runner: SandboxRunner | None = None,
     tool_registry: ToolRegistry | None = None,
+    gateway: PermissionGateway | None = None,
 ) -> FunctionTool:
     """将子 Agent 创建器转为主 Agent 可直接调用的工具入口（Agent.as_tool）。
 
@@ -684,6 +883,7 @@ def get_subagent_creator_as_tool(
         sandbox_runner: 沙箱执行器（供动态工具池使用）。
         tool_registry: 工具注册表；提供时把已审批的生成工具并入
             动态子 Agent 可注入工具池。
+        gateway: 工具授权网关；透传给 build_creator_tools 启用运行时校验。
 
     Returns:
         ``FunctionTool``：工具名 "subagent_creator"，返回值经输出提取器
@@ -698,6 +898,7 @@ def get_subagent_creator_as_tool(
         registry=registry,
         sandbox_runner=sandbox_runner,
         tool_registry=tool_registry,
+        gateway=gateway,
     )
     return agent.as_tool(
         tool_name=AGENT_NAME,
@@ -727,6 +928,7 @@ def get_mcp_server(
     registry: AgentRegistry | None = None,
     sandbox_runner: SandboxRunner | None = None,
     tool_registry: ToolRegistry | None = None,
+    gateway: PermissionGateway | None = None,
 ) -> MCPToolServer:
     """将子 Agent 创建器包装为 MCP Server（供主管与 MCPClient 统一调用）。
 
@@ -742,6 +944,8 @@ def get_mcp_server(
         sandbox_runner: 沙箱执行器（供动态工具池使用）。
         tool_registry: 工具注册表；提供时把已审批的生成工具并入
             动态子 Agent 可注入工具池。
+        gateway: 工具授权网关；透传给 build_creator_tools 启用运行时校验
+            （主管编排器应传入与规划阶段共享的同一网关实例）。
 
     Returns:
         ``MCPToolServer``：name="subagent_creator"，含单个工具的 MCP Server。
@@ -755,6 +959,7 @@ def get_mcp_server(
         registry=registry,
         sandbox_runner=sandbox_runner,
         tool_registry=tool_registry,
+        gateway=gateway,
     )
     return agent_to_mcp_server(
         agent,

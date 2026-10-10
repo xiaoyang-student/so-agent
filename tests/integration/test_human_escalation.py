@@ -2,8 +2,8 @@
 
 模拟场景（无真实模型调用，monkeypatch 替换 workflow 模块内的 Runner）：
 1. 计划评审一次性通过（拆解本身没有问题），但执行阶段持续失败：
-   首批触发"三次尝试 + 一次替换申请 + 替代失败 → 分解问题"，后续批次
-   替换额度耗尽直接上报分解问题；
+   首批触发"同因两次尝试 + 一次替换申请 + 替代同因两次失败 → 分解
+   问题"，后续批次替换额度耗尽直接上报分解问题；
 2. 每批失败消耗一次拆分修改额度并重规划（计划评审继续通过）；
 3. 3 次额度耗尽 → 第四次失败批次后转入 human_required 终态，
    组装完整的人工升级材料包（原始任务、历代计划、失败历史、
@@ -49,10 +49,37 @@ class FakeRunResult:
         self.final_output = final_output
 
 
+class FakeStreamedResult:
+    """假 RunResultStreaming：首次取流式事件时求值协程工厂并回填输出。
+
+    正常路径下取到假事件后迭代结束，返回对象（final_output 已就绪）；
+    ``cancel`` 记录超时收尾路径。
+    """
+
+    def __init__(self, run_call):
+        self._run_call = run_call
+        self.final_output = None
+        self.raw_responses = []
+        self.cancelled = False
+
+    def cancel(self, mode="immediate"):
+        self.cancelled = True
+
+    async def stream_events(self):
+        result = await self._run_call()
+        self.final_output = result.final_output
+        self.raw_responses = getattr(result, "raw_responses", None) or []
+        yield {"type": "fake_event"}
+
+
 def install_fake_runner(
     monkeypatch, *, orchestrator, review_agent, supervisor, reviews
 ):
-    """把 workflow 模块内的 Runner 替换为按 Agent 身份分派的假 Runner。"""
+    """把 workflow 模块内的 Runner 替换为按 Agent 身份分派的假 Runner。
+
+    主管 Agent 经 ``run_streamed``（run_agent_streamed 的流式入口），
+    评审仍走 ``run``。
+    """
 
     class FakeRunner:
         @classmethod
@@ -62,6 +89,14 @@ def install_fake_runner(
                 return FakeRunResult(reviews(review_input))
             payload = json.loads(input)
             return FakeRunResult(supervisor(payload))
+
+        @classmethod
+        def run_streamed(cls, starting_agent, input=None, *, max_turns=None, **kwargs):
+            return FakeStreamedResult(
+                lambda: cls.run(
+                    starting_agent, input=input, max_turns=max_turns, **kwargs
+                )
+            )
 
     monkeypatch.setattr(workflow_mod, "Runner", FakeRunner)
 
@@ -147,6 +182,8 @@ class ReviewScript:
             decision = ReviewDecision(
                 stage="result_review",
                 passed=self.result_passed,
+                issues=[] if self.result_passed else ["整体结果不满足验收标准"],
+                required_fixes=[] if self.result_passed else ["修复整体结果后重新提交"],
                 summary="结果评审（模拟）",
             )
         else:
@@ -223,12 +260,13 @@ class TestPersistentExecutionFailure:
 
         # 主管调用统计：
         # - 规划 1 次 + 重规划 3 次（每批失败消耗一次额度）
-        # - 执行子任务 15 次 = 首批 6 次（原始 3 + 替代 3）+ 其后每批 3 次
+        # - 执行子任务 10 次 = 首批 4 次（原始 2 + 替代 2，同因抑制）
+        #   + 其后每批 2 次（替换额度耗尽后仅原始 Agent 两次尝试）
         # - 从未进入汇总阶段
         phases = supervisor.phases
         assert phases.count("planning") == 1
         assert phases.count("replanning") == 3
-        assert phases.count("execute_subtask") == 15
+        assert phases.count("execute_subtask") == 10
         assert phases.count("aggregating") == 0
 
         # 计划评审 4 批 × 2 轮全部通过；从未进行结果评审

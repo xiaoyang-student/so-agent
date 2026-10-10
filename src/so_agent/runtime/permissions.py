@@ -9,7 +9,9 @@
 - 主管专属工具（``assignable=False``，如 code_agent / subagent_creator）
   严禁出现在任何授权白名单中：启用工具注册表时 ``issue_grant`` 直接拒绝；
 - ``revoke_grant`` 撤销立即生效；``purge_expired`` 主动清理过期授权；
-- 拒绝一切未授权调用：校验不通过返回 False，由调用方（沙箱/工具层）拦截。
+- 拒绝一切未授权调用：校验不通过返回 False，由调用方（沙箱/工具层）拦截，
+  同时记录 ``tool_denied`` 审计事件（细分拒绝原因：参数非法、无匹配授权、
+  已撤销、已过期、工具不在白名单），供安全审计与事件回放使用。
 
 全局约束：授权凭证内容为纯数据（Pydantic 模型），可作为 JSON 在 Agent
 之间传递与审计，不携带任何可执行内容。
@@ -22,19 +24,19 @@ from datetime import datetime, timezone
 
 from so_agent.config import Settings, get_settings
 from so_agent.context import ProjectContext
-from so_agent.models import ToolGrant
-from so_agent.runtime.events import EVENT_TOOL_GRANTED, EVENT_TOOL_REVOKED, EventLogger
+from so_agent.models import ToolGrant, _utc_now
+from so_agent.runtime.events import (
+    EVENT_TOOL_DENIED,
+    EVENT_TOOL_GRANTED,
+    EVENT_TOOL_REVOKED,
+    EventLogger,
+)
 from so_agent.runtime.registry import DEFAULT_SUPERVISOR_ID
 from so_agent.runtime.tool_registry import ToolRegistry
 
 
 class PermissionGatewayError(Exception):
     """授权网关领域错误：授权不存在、参数非法等。"""
-
-
-def _utc_now() -> datetime:
-    """返回当前 UTC 时间（统一时间基准）。"""
-    return datetime.now(timezone.utc)
 
 
 def _ensure_aware(moment: datetime) -> datetime:
@@ -164,8 +166,13 @@ class PermissionGateway:
         )
         return grant
 
-    def revoke_grant(self, grant_id: str) -> None:
+    def revoke_grant(self, grant_id: str, *, reason: str = "revoked") -> None:
         """撤销授权（立即生效；重复撤销为幂等操作）。
+
+        Args:
+            grant_id: 授权编号。
+            reason: 撤销原因（写入 ``tool_revoked`` 审计事件）；生命周期
+                清理可传细分原因（如 ``lifecycle_cleanup:<路径>``）。
 
         Raises:
             PermissionGatewayError: grant_id 不存在时。
@@ -182,20 +189,51 @@ class PermissionGateway:
                 "task_id": grant.task_id,
                 "agent_id": grant.agent_id,
                 "grant": grant.model_dump(mode="json"),
-                "reason": "revoked",
+                "reason": reason,
             },
         )
 
-    def revoke_grants_for_agent(self, agent_id: str) -> list[str]:
+    def revoke_grants_for_agent(
+        self, agent_id: str, *, reason: str = "revoked"
+    ) -> list[str]:
         """批量撤销某 Agent 的全部有效授权（释放/替换 Agent 时回收权限）。
 
+        Args:
+            agent_id: 被授权 Agent 标识（授权槽位标识）。
+            reason: 撤销原因（透传写入 ``tool_revoked`` 审计事件）。
+
         Returns:
-            被撤销的 grant_id 列表。
+            被撤销的 grant_id 列表（此前已撤销的不计入；重复调用返回
+            空列表，不产生重复事件、不抛错）。
         """
         revoked: list[str] = []
         for grant in list(self._grants.values()):
             if grant.agent_id == agent_id and not grant.revoked:
-                self.revoke_grant(grant.grant_id)
+                self.revoke_grant(grant.grant_id, reason=reason)
+                revoked.append(grant.grant_id)
+        return revoked
+
+    def revoke_grants_for_task(
+        self, task_id: str, *, reason: str = "revoked"
+    ) -> list[str]:
+        """批量撤销某任务下全部有效授权（统一幂等清理入口）。
+
+        生命周期清理按任务维度收口：撤销该任务当前所有未撤销的授权，
+        并以明确的 ``reason`` 记录 ``tool_revoked`` 审计事件。对无授权
+        任务为空操作；重复调用幂等（已撤销的不再处理）。
+
+        Args:
+            task_id: 授权绑定的任务编号。
+            reason: 清理原因（写入审计事件，如
+                ``lifecycle_cleanup:pipeline_timeout``）。
+
+        Returns:
+            本次被撤销的 grant_id 列表（此前已撤销的不计入）。
+        """
+        revoked: list[str] = []
+        for grant in list(self._grants.values()):
+            if grant.task_id == task_id and not grant.revoked:
+                self.revoke_grant(grant.grant_id, reason=reason)
                 revoked.append(grant.grant_id)
         return revoked
 
@@ -246,24 +284,64 @@ class PermissionGateway:
 
         校验维度：调用者（agent_id）、任务编号（task_id）、工具名称
         （tool_name 属于 allowed_tools）、授权有效性（未撤销、未过期）。
-        全部满足才返回 True；任一不满足立即拒绝（返回 False）。
+        全部满足才返回 True；任一不满足立即拒绝（返回 False），并记录
+        ``tool_denied`` 审计事件（拒绝原因细分：参数非法、无匹配授权、
+        已撤销、已过期、工具不在白名单）。
         """
         if not all(
             isinstance(value, str) and value.strip()
             for value in (agent_id, tool_name, task_id)
         ):
+            self._log_denial(
+                agent_id, tool_name, task_id,
+                "参数非法（agent_id/tool_name/task_id 须为非空字符串）",
+            )
             return False
 
         moment = _utc_now()
+        denial_reason: str | None = None
         for grant in self._grants.values():
             if grant.agent_id != agent_id or grant.task_id != task_id:
                 continue
-            if grant.revoked or tool_name not in grant.allowed_tools:
-                continue
-            if grant.expires_at is not None and _ensure_aware(grant.expires_at) <= moment:
-                continue
-            return True
+            if grant.revoked:
+                reason = "授权已撤销"
+            elif tool_name not in grant.allowed_tools:
+                reason = "工具不在授权白名单"
+            elif (
+                grant.expires_at is not None
+                and _ensure_aware(grant.expires_at) <= moment
+            ):
+                reason = "授权已过期"
+            else:
+                return True
+            # 记录首个匹配授权的拒绝原因（同主体多授权时以最靠前的为准）
+            if denial_reason is None:
+                denial_reason = reason
+        self._log_denial(
+            agent_id, tool_name, task_id, denial_reason or "无匹配授权"
+        )
         return False
+
+    def _log_denial(
+        self, agent_id: str, tool_name: str, task_id: str, reason: str
+    ) -> None:
+        """记录一次工具调用拒绝的审计事件（tool_denied）。
+
+        Args:
+            agent_id: 被拒绝的调用者标识（可能为非字符串/空值，原样留痕）。
+            tool_name: 被拒绝调用的工具名称。
+            task_id: 调用声称所属的任务编号。
+            reason: 细分拒绝原因（中文短语，供审计与人工排查）。
+        """
+        self._events.log_event(
+            EVENT_TOOL_DENIED,
+            {
+                "agent_id": agent_id,
+                "tool_name": tool_name,
+                "task_id": task_id,
+                "reason": reason,
+            },
+        )
 
     def get_grant(self, grant_id: str) -> ToolGrant | None:
         """按 grant_id 查询授权记录（含已撤销，供审计）。"""
