@@ -13,11 +13,6 @@
 - 中文架构文档：[多_Agent_框架.md](./多_Agent_框架.md)
 - English architecture document: [SO_Agent_Execution_Runtime.md](./SO_Agent_Execution_Runtime.md)
 
-
-## 架构概览
-
-<!-- Mermaid 流程图 -->
-
 graph TD
     %% 样式定义
     classDef purple fill:#e6e6fa,stroke:#333,stroke-width:1px;
