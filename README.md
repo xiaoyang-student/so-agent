@@ -17,6 +17,7 @@
 ## 架构概览
 
 <!-- Mermaid 流程图 -->
+
 graph TD
     %% --- 样式定义 ---
     classDef purple fill:#e6e6fa,stroke:#333,stroke-width:1px;
