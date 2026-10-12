@@ -27,6 +27,7 @@ The implemented capabilities include two-stage reviews; the complete lifecycle f
 
 Solid lines represent the primary task flow. Dashed lines represent conditional paths and intervention points for the cross-cutting control plane. Deferred and planned directions—including multidimensional budgets, context governance, production container sandboxes, Temporal, a unified ModelGateway, and OpenTelemetry—are excluded from the diagram. See Capability Status and Roadmap below for details.
 
+```mermaid
 flowchart TB
     subgraph ENTRY["Entry Points and Four-Quadrant Routing"]
       CLI["CLI: One-Shot Tasks / --daemon Mode"]
@@ -116,6 +117,7 @@ flowchart TB
     MIG -.->|"Versioned Migrations"| STORE
     ENGINE -.->|"Unrecoverable Error / Cancellation Cleanup"| STOPPED
 
+```
 Responsibility Boundaries
 
 LLMs—including the supervisor, review agents, and sub-agents—are responsible only for semantic understanding, task decomposition during planning, review feedback, and content generation.
