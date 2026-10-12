@@ -13,6 +13,103 @@
 - 中文架构文档：[多_Agent_框架.md](./多_Agent_框架.md)
 - English architecture document: [SO_Agent_Execution_Runtime.md](./SO_Agent_Execution_Runtime.md)
 
+## 架构总览
+
+下图是当前代码实现形态的总览（仅含已实现能力）：入口经四象限路由分发；完整工作流由薄编排器与规划 / 执行 / 汇总三协调器驱动，覆盖两阶段评审、授权 proposal 到 ToolGrant 的完整生命周期、确定性失败恢复、星型隔离子 Agent、动态工具创建与沙箱验收，以及贯穿全程的横向控制面（停止门、影子状态机、审计事件、ResultStore 与 schema 迁移、人工兜底）。图中实线为任务主流程，虚线为条件路径与横向控制面介入点；暂缓与规划中的方向（多维预算、上下文治理、生产容器沙箱、Temporal、统一 ModelGateway、OpenTelemetry 等）不在图中，详见下文「能力状态与路线图」。
+
+```mermaid
+flowchart TB
+    subgraph ENTRY["入口与四象限路由"]
+      CLI["CLI：一次性任务 / --daemon 守护进程"]
+      ROUTER["TaskRouter：规则预判 + 一次轻量 LLM 分类"]
+      Q1["直接回答"]
+      Q2["深度推理"]
+      Q3["持久化任务：SQLite + 守护进程调度"]
+      Q4["完整工作流"]
+    end
+    ENGINE["WorkflowEngine 薄编排器（主循环 / 输出组装）"]
+    subgraph PLANNING["规划：PlanningCoordinator"]
+      SUP["主管 Agent：拆解 / 重规划（LLM）"]
+      PROP["授权 proposal（纯候选，未生效）"]
+      REV1["评审 Agent：计划评审 + 授权评审（LLM）"]
+      CONTRACT1["passed 契约校验（fail closed）"]
+      ISSUE["PermissionGateway：签发 ToolGrant"]
+      REUSE["显式结果复用：reuse_from + 代码安全校验"]
+      REPLAN["有限重规划（≤3 次）"]
+    end
+    subgraph EXECUTION["执行：ExecutionCoordinator + Scheduler"]
+      SCHED["执行调度：依赖 / 并发上限 / 五层超时 / 取消"]
+      STAR["星型隔离子 Agent（LLM）：仅主管中转"]
+      MCPHUB["MCP 四层 + ToolRegistry 工具注册"]
+      GAP["工具缺口：动态创建 → 沙箱验收 → 注册 → 补发授权"]
+      CLASSIFY["FailureClassifier 分类 + 指纹去重"]
+      POLICY["RecoveryPolicy 决策矩阵（provider 禁替换）"]
+      FIX["FORMAT：单次契约修复"]
+      REPLACE["replacement：深度 1，无再申请权"]
+    end
+    subgraph AGGREGATION["汇总：AggregationCoordinator"]
+      SUM["结果汇总（LLM 生成）"]
+      REV2["评审 Agent：结果评审（LLM）"]
+      CONTRACT2["passed 契约校验（fail closed）"]
+      REWORK["返工：仅重跑被指出子任务"]
+    end
+    subgraph CONTROL["横向控制面（代码，全程生效）"]
+      GATE["PipelineGate：deadline / 取消 → 拒绝新动作，隔离迟到结果"]
+      FSM["TaskStateMachine：13 阶段影子 FSM"]
+      AUDIT["EventLogger：审计事件 + 本地日志"]
+      STORE["ResultStore：执行记录 + 计划版本"]
+      MIG["SQLite schema：顺序增量迁移，fail closed"]
+    end
+    subgraph FINALS["终态"]
+      DONE["completed"]
+      HUMAN["human_required：HumanEscalationRequest 交接"]
+      STOPPED["failed / cancelled"]
+    end
+    CLI --> ROUTER
+    ROUTER -->|"简单+短"| Q1
+    ROUTER -->|"复杂+短"| Q2
+    ROUTER -->|"简单+长"| Q3
+    ROUTER -->|"复杂+长，分类失败降级"| Q4
+    Q4 --> ENGINE
+    ENGINE --> SUP
+    SUP --> PROP
+    PROP --> REV1
+    REV1 --> CONTRACT1
+    CONTRACT1 -->|"两路 passed"| ISSUE
+    CONTRACT1 -->|"未通过：消耗拆分额度"| SUP
+    ISSUE -->|"授权就绪"| SCHED
+    ISSUE -.->|"采纳计划：校验 reuse_from"| REUSE
+    REUSE -.->|"校验通过：复用旧结果"| SCHED
+    REPLAN -->|"重新拆解"| SUP
+    REPLAN -.->|"额度耗尽"| HUMAN
+    SCHED --> STAR
+    STAR -->|"经 MCP 调用授权工具"| MCPHUB
+    SCHED -.->|"计划引用未注册工具"| GAP
+    GAP -->|"注册为新工具"| MCPHUB
+    GAP -->|"补发授权后重试"| SCHED
+    STAR -->|"失败"| CLASSIFY
+    CLASSIFY --> POLICY
+    POLICY -->|"network / rate_limit：退避重试"| SCHED
+    POLICY -->|"quality / tool / sandbox：重试耗尽则替换"| REPLACE
+    POLICY -->|"format"| FIX
+    FIX -->|"修复仍失败"| REPLAN
+    REPLACE -->|"替代仍失败：拆分问题"| REPLAN
+    STAR -->|"子任务完成"| SUM
+    SUM --> REV2
+    REV2 --> CONTRACT2
+    CONTRACT2 -->|"passed"| DONE
+    CONTRACT2 -->|"未通过"| REWORK
+    REWORK -->|"重跑被指出子任务"| SCHED
+    GATE -.->|"停止门校验"| ENGINE
+    FSM -.->|"状态迁移映射"| ENGINE
+    AUDIT -.->|"全程留痕"| ENGINE
+    STORE -.->|"结果 / 版本持久化"| SCHED
+    MIG -.->|"版本化迁移"| STORE
+    ENGINE -.->|"不可恢复错误 / 取消收尾"| STOPPED
+```
+
+职责边界：LLM（主管 / 评审 / 子 Agent）只负责语义理解、任务拆解（规划）、评审意见与内容生成；任务状态流转、权限签发与撤销、调度、超时、取消、失败恢复策略与最终 `passed` 放行判定全部由确定性代码层做出——评审结论也只有经代码层契约校验（fail closed）后才生效。
+
 
 ## 核心特性（已实现）
 
