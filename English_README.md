@@ -4,6 +4,12 @@
   </a>
 </div>
 
+<h1 align="center">SO-Agent</h1>
+<p align="center">
+  <b>A Deterministic, Zero-Trust Multi-Agent Runtime</b><br>
+  <i>LLMs think, Code decides.</i>
+</p>
+
 # SO-Agent
 
 A governed multi-agent execution runtime: a two-tier, star-topology multi-agent orchestration framework built on the [OpenAI Agents SDK](https://github.com/openai/openai-agents-python). The core design principle is **LLM-as-Thinker, Code-as-Decider** — the LLM understands goals, decomposes tasks, generates instructions, and analyzes content; all decisions such as state transitions, permission issuance, retry control, and execution scheduling are made by the deterministic code layer.
