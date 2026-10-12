@@ -4,6 +4,12 @@
   </a>
 </div>
 
+<h1 align="center">SO-Agent</h1>
+<p align="center">
+  <b>受控的多 Agent 执行运行时</b><br>
+  <i>LLM 负责思考，代码负责决策。</i>
+</p>
+
 # SO-Agent
 
 受控的多 Agent 执行运行时：基于 [OpenAI Agents SDK](https://github.com/openai/openai-agents-python) 构建的两层星型多 Agent 编排框架。核心设计原则是 **LLM 负责思考，代码负责决策**——LLM 负责理解目标、拆解任务、生成指令与分析内容；状态流转、权限签发、重试控制与执行调度等一切决策均由确定性代码层做出。
