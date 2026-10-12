@@ -19,6 +19,122 @@ A governed multi-agent execution runtime: a two-tier, star-topology multi-agent 
 - Architecture document (English): [SO_Agent_Execution_Runtime.md](./SO_Agent_Execution_Runtime.md)
 - 中文架构文档：[多_Agent_框架.md](./多_Agent_框架.md)
 
+# Architecture Overview
+
+The diagram below provides an overview of the current implementation architecture, covering implemented capabilities only. Requests enter through a four-quadrant routing layer. The full workflow is driven by a thin orchestrator and three coordinators for planning, execution, and aggregation.
+
+The implemented capabilities include two-stage reviews; the complete lifecycle from authorization proposals to ToolGrant issuance; deterministic failure recovery; star-topology isolation for sub-agents; dynamic tool creation and sandbox acceptance testing; and a cross-cutting control plane spanning the entire workflow, including a stop gate, a shadow state machine, audit events, ResultStore with schema migrations, and human escalation.
+
+Solid lines represent the primary task flow. Dashed lines represent conditional paths and intervention points for the cross-cutting control plane. Deferred and planned directions—including multidimensional budgets, context governance, production container sandboxes, Temporal, a unified ModelGateway, and OpenTelemetry—are excluded from the diagram. See Capability Status and Roadmap below for details.
+
+flowchart TB
+    subgraph ENTRY["Entry Points and Four-Quadrant Routing"]
+      CLI["CLI: One-Shot Tasks / --daemon Mode"]
+      ROUTER["TaskRouter: Rule-Based Preclassification + One Lightweight LLM Classification Call"]
+      Q1["Direct Response"]
+      Q2["Deep Reasoning"]
+      Q3["Persistent Tasks: SQLite + Daemon Scheduling"]
+      Q4["Full Workflow"]
+    end
+    ENGINE["WorkflowEngine: Thin Orchestrator (Main Loop / Output Assembly)"]
+    subgraph PLANNING["Planning: PlanningCoordinator"]
+      SUP["Supervisor Agent: Task Decomposition / Replanning (LLM)"]
+      PROP["Authorization Proposal (Candidate Only; Not Yet Effective)"]
+      REV1["Review Agent: Plan Review + Authorization Review (LLM)"]
+      CONTRACT1["passed Contract Validation (Fail-Closed)"]
+      ISSUE["PermissionGateway: Issue ToolGrant"]
+      REUSE["Explicit Result Reuse: reuse_from + Code Safety Validation"]
+      REPLAN["Bounded Replanning (≤3 Attempts)"]
+    end
+    subgraph EXECUTION["Execution: ExecutionCoordinator + Scheduler"]
+      SCHED["Execution Scheduling: Dependencies / Concurrency Limits / Five-Layer Timeouts / Cancellation"]
+      STAR["Star-Topology Isolated Sub-Agents (LLM): Supervisor as the Sole Intermediary"]
+      MCPHUB["Four-Layer MCP + ToolRegistry"]
+      GAP["Tool Gap: Dynamic Creation → Sandbox Acceptance Testing → Registration → Supplemental Authorization"]
+      CLASSIFY["FailureClassifier: Classification + Fingerprint-Based Deduplication"]
+      POLICY["RecoveryPolicy: Decision Matrix (Provider Substitution Prohibited)"]
+      FIX["FORMAT: One-Time Contract Repair"]
+      REPLACE["Replacement: Maximum Depth 1, No Further Replacement Requests"]
+    end
+    subgraph AGGREGATION["Aggregation: AggregationCoordinator"]
+      SUM["Result Aggregation (LLM-Generated)"]
+      REV2["Review Agent: Result Review (LLM)"]
+      CONTRACT2["passed Contract Validation (Fail-Closed)"]
+      REWORK["Rework: Rerun Only the Subtasks Identified in Review Feedback"]
+    end
+    subgraph CONTROL["Cross-Cutting Control Plane (Code-Enforced Throughout)"]
+      GATE["PipelineGate: Deadline / Cancellation → Reject New Actions and Isolate Late Results"]
+      FSM["TaskStateMachine: 13-Stage Shadow FSM"]
+      AUDIT["EventLogger: Audit Events + Local Logs"]
+      STORE["ResultStore: Execution Records + Plan Versions"]
+      MIG["SQLite Schema: Ordered Incremental Migrations, Fail-Closed"]
+    end
+    subgraph FINALS["Terminal States"]
+      DONE["completed"]
+      HUMAN["human_required: HumanEscalationRequest Handoff"]
+      STOPPED["failed / cancelled"]
+    end
+    CLI --> ROUTER
+    ROUTER -->|"Simple + Short"| Q1
+    ROUTER -->|"Complex + Short"| Q2
+    ROUTER -->|"Simple + Long-Running"| Q3
+    ROUTER -->|"Complex + Long-Running; Fallback on Classification Failure"| Q4
+    Q4 --> ENGINE
+    ENGINE --> SUP
+    SUP --> PROP
+    PROP --> REV1
+    REV1 --> CONTRACT1
+    CONTRACT1 -->|"Both Checks Passed"| ISSUE
+    CONTRACT1 -->|"Validation Failed: Consume Decomposition Budget"| SUP
+    ISSUE -->|"Authorization Ready"| SCHED
+    ISSUE -.->|"Adopt Plan: Validate reuse_from"| REUSE
+    REUSE -.->|"Validation Passed: Reuse Previous Results"| SCHED
+    REPLAN -->|"Decompose Again"| SUP
+    REPLAN -.->|"Budget Exhausted"| HUMAN
+    SCHED --> STAR
+    STAR -->|"Invoke Authorized Tools via MCP"| MCPHUB
+    SCHED -.->|"Plan References an Unregistered Tool"| GAP
+    GAP -->|"Register as a New Tool"| MCPHUB
+    GAP -->|"Retry After Supplemental Authorization"| SCHED
+    STAR -->|"Failure"| CLASSIFY
+    CLASSIFY --> POLICY
+    POLICY -->|"network / rate_limit: Retry with Backoff"| SCHED
+    POLICY -->|"quality / tool / sandbox: Replace After Retries Are Exhausted"| REPLACE
+    POLICY -->|"format"| FIX
+    FIX -->|"Repair Still Fails"| REPLAN
+    REPLACE -->|"Replacement Still Fails: Decompose the Problem"| REPLAN
+    STAR -->|"Subtask Completed"| SUM
+    SUM --> REV2
+    REV2 --> CONTRACT2
+    CONTRACT2 -->|"passed"| DONE
+    CONTRACT2 -->|"Validation Failed"| REWORK
+    REWORK -->|"Rerun Identified Subtasks"| SCHED
+    GATE -.->|"Stop-Gate Checks"| ENGINE
+    FSM -.->|"State Transition Mapping"| ENGINE
+    AUDIT -.->|"End-to-End Audit Trail"| ENGINE
+    STORE -.->|"Persist Results / Versions"| SCHED
+    MIG -.->|"Versioned Migrations"| STORE
+    ENGINE -.->|"Unrecoverable Error / Cancellation Cleanup"| STOPPED
+
+Responsibility Boundaries
+
+LLMs—including the supervisor, review agents, and sub-agents—are responsible only for semantic understanding, task decomposition during planning, review feedback, and content generation.
+
+All task state transitions, permission issuance and revocation, scheduling, timeout enforcement, cancellation, failure recovery policies, and the final passed release decision are determined by the deterministic code layer.
+
+Review decisions take effect only after passing contract validation in the code layer. The validation process follows a fail-closed policy: a review decision that fails validation cannot authorize the workflow to proceed.
+
+Capability Status and Roadmap
+
+The diagram intentionally includes only implemented capabilities. The following directions are deferred or planned and are not represented as implemented functionality:
+
+Multidimensional budgets
+Context governance
+Production-grade container sandboxing
+Temporal-based workflow orchestration
+A unified ModelGateway
+OpenTelemetry integration
+
 ## Core Features (Implemented)
 
 All capabilities below are implemented in the current code and covered by **1209 tests (current snapshot)**:
