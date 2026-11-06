@@ -1,0 +1,72 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "so-agent"
+version = "0.1.0"
+description = "A governed multi-agent execution runtime: LLM thinks, code decides."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.13",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "openai-agents>=0.22.0,<0.23",
+    "openai>=3.0.0,<4",
+    "pydantic>=2.12.2,<3",
+    "pydantic-settings>=2.0",
+    "json-repair>=0.30",
+    "pyyaml",
+    "python-statemachine>=3.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+]
+web = [
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+]
+otel = [
+    "opentelemetry-api>=1.20",
+    "opentelemetry-sdk>=1.20",
+    "opentelemetry-exporter-otlp>=1.20",
+]
+
+[project.scripts]
+so-agent = "so_agent.main:main"
+so-agent-web = "so_agent.web.app:main"
+so-agent-sandbox = "so_agent.sandbox_cli:main"
+so-agent-audit = "so_agent.audit_cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+# api_config.yaml：运行时由 config_loader 从包目录加载（顶层供路由分类、
+# 三个工具包各一份供对应 Agent 使用）；prompt.md：三个固定 Agent 的
+# 系统提示词，agent.py 以包目录相对路径读取，必须随包分发。
+# web/static：Web 控制台单页前端（无外部 CDN 依赖）。
+so_agent = [
+    "api_config.yaml",
+    "tool_packages/*/api_config.yaml",
+    "tool_packages/*/prompt.md",
+]
+"so_agent.web" = [
+    "static/*",
+    "static/fonts/*",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+pythonpath = ["src"]

@@ -1,0 +1,29 @@
+{
+  "name": "run_go_in_sandbox",
+  "description": "在沙箱中运行或静态分析 Go 源代码：校验参数后，dry_run 模式返回 package 子句/行数/字符数等静态信息；执行模式调用本机 go 工具链运行源码并返回 stdout/stderr/exit_code，无 go 环境时返回结构化 go_not_found 错误。所有返回值均为 JSON 可序列化 dict。",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "source": {
+        "type": "string",
+        "description": "Go 源代码文本，必须为非空字符串"
+      },
+      "timeout": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 30,
+        "default": 10,
+        "description": "执行超时秒数，取值 1-30"
+      },
+      "dry_run": {
+        "type": "boolean",
+        "default": false,
+        "description": "为 true 时仅静态分析不执行"
+      }
+    },
+    "required": [
+      "source"
+    ],
+    "additionalProperties": false
+  }
+}

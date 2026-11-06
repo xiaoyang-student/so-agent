@@ -1,0 +1,258 @@
+{
+  "version": 1,
+  "description": "固定质量回归集：5 类任务、固定输入与确定性评分；每次优化后复跑同一套用例。",
+  "cases": [
+    {
+      "id": "qa_math",
+      "category": "direct_qa",
+      "expected_task_type": "direct_answer",
+      "objective": "计算 3+7，只回答数字。",
+      "constraints": "只输出阿拉伯数字，不要解释。",
+      "acceptance_criteria": "答案等于 10。",
+      "checks": [
+        {
+          "kind": "regex",
+          "value": "^\\s*10\\s*[。.]?\\s*$",
+          "label": "只输出 10",
+          "weight": 2
+        },
+        {"kind": "max_chars", "value": 8, "label": "答案不超过 8 字符"}
+      ]
+    },
+    {
+      "id": "qa_water",
+      "category": "direct_qa",
+      "expected_task_type": "direct_answer",
+      "objective": "请用一句话回答：水的化学式是什么？",
+      "constraints": "只回答一句话，不要解释。",
+      "acceptance_criteria": "答案包含 H2O。",
+      "checks": [
+        {"kind": "contains", "value": ["H2O"], "label": "包含关键值 H2O"},
+        {"kind": "max_sentences", "value": 1, "label": "只回答一句"},
+        {"kind": "max_chars", "value": 60, "label": "答案简洁"},
+        {
+          "kind": "not_contains",
+          "value": ["因为", "解释", "首先"],
+          "label": "不附加分析"
+        }
+      ]
+    },
+    {
+      "id": "qa_http_methods",
+      "category": "direct_qa",
+      "expected_task_type": "direct_answer",
+      "objective": "GET 与 POST 的核心区别是什么？",
+      "constraints": "用两句话回答，不要超过两句。",
+      "acceptance_criteria": "两句话内说明主要区别。",
+      "checks": [
+        {"kind": "contains", "value": ["GET", "POST"], "label": "覆盖两种方法"},
+        {"kind": "max_sentences", "value": 2, "label": "不超过两句"},
+        {"kind": "max_chars", "value": 200, "label": "答案简洁"}
+      ]
+    },
+    {
+      "id": "deep_cap",
+      "category": "deep_reasoning",
+      "expected_task_type": "deep_reasoning",
+      "objective": "解释 CAP 定理的核心含义。",
+      "constraints": "用不超过三句话说明，不要展开证明。",
+      "acceptance_criteria": "覆盖一致性、可用性与分区容错三个要素。",
+      "checks": [
+        {
+          "kind": "contains",
+          "value": ["一致性", "可用性", "分区容错"],
+          "label": "覆盖 CAP 三要素"
+        },
+        {"kind": "max_sentences", "value": 3, "label": "不超过三句"},
+        {"kind": "max_chars", "value": 300, "label": "答案简洁"}
+      ]
+    },
+    {
+      "id": "deep_http_versions",
+      "category": "deep_reasoning",
+      "expected_task_type": "deep_reasoning",
+      "objective": "对比 HTTP/1.1 与 HTTP/2 的核心差异。",
+      "constraints": "用要点列出，最多 5 条。",
+      "acceptance_criteria": "至少提到多路复用与头部压缩。",
+      "checks": [
+        {
+          "kind": "contains",
+          "value": ["多路复用", "头部压缩"],
+          "label": "包含两个关键差异"
+        },
+        {"kind": "max_chars", "value": 600, "label": "控制篇幅"}
+      ]
+    },
+    {
+      "id": "file_note",
+      "category": "single_file",
+      "expected_task_type": "full_workflow",
+      "objective": "在沙箱中创建 note.md，内容写 FAST_PATH_OK，完成后简要说明。",
+      "constraints": "只创建 note.md，不要创建其他文件。",
+      "acceptance_criteria": "note.md 存在且内容包含 FAST_PATH_OK。",
+      "checks": [
+        {"kind": "contains", "value": ["note.md"], "label": "说明产物"},
+        {"kind": "min_chars", "value": 1, "label": "输出非空"},
+        {"kind": "max_chars", "value": 500, "label": "输出简洁"}
+      ],
+      "artifacts": [
+        {
+          "path": "note.md",
+          "contains": ["FAST_PATH_OK"],
+          "min_bytes": 10
+        }
+      ]
+    },
+    {
+      "id": "file_json",
+      "category": "single_file",
+      "expected_task_type": "full_workflow",
+      "objective": "创建 config.json，内容为 {\"enabled\": true, \"retries\": 3}，完成后简要说明。",
+      "constraints": "只创建 config.json。",
+      "acceptance_criteria": "config.json 存在且为合法 JSON，包含 enabled=true 与 retries=3。",
+      "checks": [
+        {"kind": "contains", "value": ["config.json"], "label": "说明产物"},
+        {"kind": "min_chars", "value": 1, "label": "输出非空"},
+        {"kind": "max_chars", "value": 500, "label": "输出简洁"}
+      ],
+      "artifacts": [
+        {
+          "path": "config.json",
+          "contains": ["\"enabled\"", "true", "\"retries\"", "3"],
+          "min_bytes": 10
+        }
+      ]
+    },
+    {
+      "id": "multi_http_files",
+      "category": "multi_file",
+      "expected_task_type": "full_workflow",
+      "objective": "创建 http1.md、http2.md，分别写三条 HTTP/1.1 与 HTTP/2 的核心特性，再创建 compare.md 总结差异。",
+      "constraints": "只创建这三个文件。",
+      "acceptance_criteria": "三个文件都存在且非空。",
+      "checks": [
+        {"kind": "min_chars", "value": 10, "label": "输出非空"},
+        {"kind": "max_chars", "value": 2000, "label": "控制篇幅"}
+      ],
+      "artifacts": [
+        {"path": "http1.md", "min_bytes": 30},
+        {"path": "http2.md", "min_bytes": 30},
+        {"path": "compare.md", "min_bytes": 30}
+      ]
+    },
+    {
+      "id": "multi_report_files",
+      "category": "multi_file",
+      "expected_task_type": "full_workflow",
+      "objective": "创建 data.csv 写入三行示例数据，再创建 report.md 总结 data.csv 的内容。",
+      "constraints": "只创建 data.csv 与 report.md。",
+      "acceptance_criteria": "data.csv 至少包含三行数据，report.md 存在且非空。",
+      "checks": [
+        {"kind": "min_chars", "value": 10, "label": "输出非空"},
+        {"kind": "max_chars", "value": 2000, "label": "控制篇幅"}
+      ],
+      "artifacts": [
+        {"path": "data.csv", "contains": [","], "min_bytes": 10},
+        {"path": "report.md", "min_bytes": 10}
+      ]
+    },
+    {
+      "id": "instr_one_sentence",
+      "category": "instruction_following",
+      "expected_task_type": "deep_reasoning",
+      "objective": "用一句话说明什么是幂等性。",
+      "constraints": "只能回答一句话，不得展开或附加分析过程。",
+      "acceptance_criteria": "一句话且包含“重复执行”。",
+      "checks": [
+        {"kind": "contains", "value": ["重复执行"], "label": "命中关键含义"},
+        {"kind": "max_sentences", "value": 1, "label": "严格一句话"},
+        {"kind": "max_chars", "value": 120, "label": "控制篇幅"},
+        {
+          "kind": "not_contains",
+          "value": ["分析过程", "总结", "首先"],
+          "label": "不附加分析段"
+        }
+      ]
+    },
+    {
+      "id": "instr_no_markdown",
+      "category": "instruction_following",
+      "expected_task_type": "deep_reasoning",
+      "objective": "说明如何学习 Python，不要使用 Markdown、列表或代码块。",
+      "constraints": "纯段落文本，不得出现任何 Markdown 标记；总字数不超过 500 字。",
+      "acceptance_criteria": "输出为纯文本段落，无 Markdown 标记，且不超过 500 字。",
+      "checks": [
+        {"kind": "min_chars", "value": 20, "label": "内容充分"},
+        {"kind": "max_chars", "value": 500, "label": "控制篇幅"},
+        {
+          "kind": "not_contains",
+          "value": ["```", "- ", "# ", "**", "1. "],
+          "label": "不使用 Markdown 标记"
+        }
+      ]
+    },
+    {
+      "id": "instr_json_only",
+      "category": "instruction_following",
+      "expected_task_type": "direct_answer",
+      "objective": "只输出一个 JSON 对象，包含 name 和 value 两个字段，name 为 so-agent，value 为 1。",
+      "constraints": "不要输出 JSON 以外的任何文字或代码围栏。",
+      "acceptance_criteria": "输出是仅含 name 与 value 的 JSON 对象。",
+      "checks": [
+        {
+          "kind": "json_object",
+          "value": {
+            "required": ["name", "value"],
+            "equals": {"name": "so-agent", "value": 1},
+            "allow_extra": false
+          },
+          "label": "JSON 字段与值完全匹配",
+          "weight": 2
+        },
+        {"kind": "no_code_fence", "label": "不使用代码围栏"},
+        {"kind": "regex", "value": "^\\s*\\{", "label": "以 JSON 开头"},
+        {"kind": "max_chars", "value": 80, "label": "无额外文字"}
+      ]
+    },
+    {
+      "id": "instr_chinese_only",
+      "category": "instruction_following",
+      "expected_task_type": "deep_reasoning",
+      "objective": "用中文解释什么是 REST，最多两句话。",
+      "constraints": "只使用中文，不要输出英文句子。",
+      "acceptance_criteria": "包含“表述性状态转移”且不超过两句。",
+      "checks": [
+        {
+          "kind": "contains",
+          "value": ["表述性状态转移"],
+          "label": "包含关键术语"
+        },
+        {"kind": "language", "value": "zh", "label": "使用中文"},
+        {"kind": "max_sentences", "value": 2, "label": "不超过两句"},
+        {"kind": "max_chars", "value": 200, "label": "控制篇幅"}
+      ]
+    },
+    {
+      "id": "instr_translate_only",
+      "category": "instruction_following",
+      "expected_task_type": "direct_answer",
+      "objective": "把“The quick brown fox jumps over the lazy dog”翻译成中文，只输出译文。",
+      "constraints": "只输出译文，不要重复英文原句或附加说明。",
+      "acceptance_criteria": "输出为中文译文且不包含英文原句。",
+      "checks": [
+        {
+          "kind": "contains_any",
+          "value": ["狐狸", "敏捷"],
+          "label": "命中译文关键词"
+        },
+        {"kind": "language", "value": "zh", "label": "输出中文"},
+        {
+          "kind": "not_contains",
+          "value": ["The quick", "翻译如下", "原文"],
+          "label": "不重复原文或附加说明"
+        },
+        {"kind": "max_chars", "value": 80, "label": "只输出译文"}
+      ]
+    }
+  ]
+}

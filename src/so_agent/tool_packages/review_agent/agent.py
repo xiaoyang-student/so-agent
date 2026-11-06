@@ -1,0 +1,1074 @@
+"""评审 Agent 构建模块（review_agent 工具包）。
+
+职责：作为主 Agent 的固定工具入口之一，构造“评审 Agent（Review Agent）”：
+
+- 读取本目录 ``prompt.md`` 作为系统提示词（instructions）；
+- 通过 ``runtime.config_loader`` 加载本目录 ``api_config.yaml``，按其中
+  ``api_key`` 直接值（或旧 ``api_key_env`` 环境变量回退）构造 OpenAI 兼容
+  聊天模型（密钥值绝不写日志）；
+- 确定性检查前置：控制层在工作流内部调用前预计算计划完整性 / 授权
+  必要性 / 结果正确性，结果随 ``ReviewInput.deterministic_findings``
+  下发（评审单轮完成）；外部 MCP / as_tool 入口仍可绑定
+  ``check_plan_completeness`` / ``check_tool_necessity`` /
+  ``check_result_correctness`` 三个工具自主复核，工具返回值统一为
+  JSON 字符串；
+- Agent 输出为纯文本 JSON（``output_type=None``，不依赖 SDK 结构化输出：
+  千问等 OpenAI 兼容接口会忽略 ``response_format=json_schema`` 并把
+  JSON 包裹在 Markdown 代码围栏中返回，故由调用方剥离围栏后按
+  ``models.ReviewDecision`` 手动校验），覆盖计划评审（含授权最小化评审）、
+  生成工具评审与结果评审各阶段的全部结论；
+- 对外同时提供 MCP 暴露契约与 MCP Server（``get_mcp_schema`` /
+  ``get_mcp_server``），使本工具可按 MCP 规范被主管 Agent 与 MCPClient
+  统一发现与调用。
+
+对外接口::
+
+    agent = create_review_agent(context)         # 构造 SDK Agent 实例
+    tool = get_review_agent_as_tool(context)     # 转为主 Agent 可用的工具入口
+    schema = get_mcp_schema()                    # MCP 暴露契约（MCPToolSchema）
+    server = get_mcp_server(context)             # 包装为 MCP Server（统一调用）
+
+全局约束（最高优先级）：
+- 所有 Agent 之间的通信必须严格使用 JSON：工具返回值与 Agent 最终输出
+  一律为可解析的 JSON（Pydantic 序列化），不允许自由文本协议；
+- 评审 Agent 只读核验，不修改任何产物、不代替执行 Agent 完成任务；
+- 一切评审结论必须有证据支撑，无法核验的断言按未通过处理。
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+from enum import Enum
+from pathlib import Path
+from typing import Any, Iterable
+
+from agents import (
+    Agent,
+    FunctionTool,
+    Model,
+    OpenAIChatCompletionsModel,
+    RunContextWrapper,
+    RunResult,
+    RunResultStreaming,
+    function_tool,
+)
+from openai import AsyncOpenAI
+from pydantic import BaseModel, Field, ValidationError
+
+from so_agent.config import Settings, get_settings
+from so_agent.context import ProjectContext
+from so_agent.json_utils import extract_json_object
+from so_agent.mcp.adapter import agent_to_mcp_server
+from so_agent.mcp.protocol import MCPToolSchema
+from so_agent.mcp.server import MCPToolServer
+from so_agent.models import (
+    ExecutionResult,
+    GeneratedToolManifest,
+    ReviewDecision,
+    SubtaskSpec,
+    TaskRequest,
+    ToolGrant,
+)
+from so_agent.runtime.model_gateway import build_chat_model as build_chat_model_with_gateway
+from so_agent.runtime.config_loader import (
+    AgentAPIConfig,
+    load_agent_api_config,
+    resolve_api_config_path,
+    resolve_model_http_timeout,
+)
+from so_agent.runtime.usage import make_usage_recorder
+
+# ---------------------------------------------------------------------------
+# 包内路径（用 pathlib 定位同目录下的提示词与 API 配置）
+# ---------------------------------------------------------------------------
+PACKAGE_DIR: Path = Path(__file__).resolve().parent
+PROMPT_PATH: Path = PACKAGE_DIR / "prompt.md"
+API_CONFIG_PATH: Path = PACKAGE_DIR / "api_config.yaml"
+
+# Agent 名称（与工具注册表 / 路由约定保持一致）
+AGENT_NAME = "review_agent"
+
+# 主管侧调用说明（同时用于 as_tool 入口与 MCP 暴露契约）
+_TOOL_DESCRIPTION = (
+    "评审 Agent：对任务拆解计划、工具授权必要性、生成工具与执行结果做独立质检，"
+    "返回 ReviewDecision 结构的 JSON 结论"
+    "（passed/issues/suggestions/required_fixes/retry_target；"
+    "passed=true 时 required_fixes 必须为空，非阻断建议写入 suggestions）。"
+)
+
+# 授权评审中视为“过于宽泛/高风险”的工具名（提示模型重点核验）
+_SUSPICIOUS_TOOLS: frozenset[str] = frozenset(
+    {"*", "all", "any", "any_tool", "shell", "exec", "sudo"}
+)
+
+# 追加在 prompt.md 之后的输入输出契约说明（不改动原始提示词文件）
+_EXTRA_INSTRUCTIONS = """
+## 结构化输入（ReviewInput）
+
+主 Agent 会以如下字段（ReviewInput）下发评审材料：
+
+- `stage`：评审阶段，取值 `plan_review` / `authorization_review` / `tool_review` / `result_review`；
+- `task_request`：原始任务请求（TaskRequest，含 objective / constraints / acceptance_criteria）；
+- `subtasks`：待评审的子任务规格列表（计划评审、授权评审时提供，可为 null）；
+- `tool_grants`：本次计划的工具授权列表（授权评审时提供，可为 null）；
+- `generated_tool`：待评审的生成工具清单（GeneratedToolManifest；工具评审时提供，可为 null）；
+- `execution_results`：全部子任务的执行结果列表（结果评审时提供，可为 null）；
+- `available_tools`：当前环境可用工具清单（计划评审时提供，可为 null）；
+- `deterministic_findings`：控制层预计算的确定性检查结果（见下节）；
+- `plan_version`：当前计划版本号。
+
+## 确定性检查结果（`deterministic_findings`，供结论参考）
+
+控制层在调用你之前已运行确定性检查，结果以字段下发，无需调用工具：
+
+- `plan_completeness`：计划结构完整性（重复 ID、空字段、依赖缺失、
+  自依赖、循环依赖），并按 `available_tools` 核对子任务声明的工具是否
+  越界；越界工具若为待创建的动态工具属正常流程，不构成拒绝理由，若
+  运行环境无法提供则应在 issues 中指出并建议替代方案；同时逐项判断
+  每个声明工具对该子任务是否必要且最小化（如纯只读分析不应声明写入/
+  执行工具），明显错配须写入 `required_fixes`；
+- `tool_necessity`：授权必要性与最小化（超额授权、未授权缺口、空授权、
+  可疑宽泛工具）。授权评审的通过/拒绝策略：under_granted（声明但未授权）不构成拒绝理由
+  （动态工具需在执行阶段创建后才能授权，计划阶段无法预先签发）；
+  仅当存在超额授权、可疑宽泛工具或工具分配明显错误时拒绝；
+- `result_correctness`：执行结果的失败项、证据完整性、产物路径越界与
+  验收标准清单。
+
+确定性结果必须纳入考量，但不得替代你的独立判断；未覆盖的语义问题
+（如验收标准覆盖度、指令与产出的一致性）仍需逐条核对。若某项检查
+标记 `status=error`，按证据不完整处理并在 issues 中说明。若你被作为
+外部 MCP 服务调用（输入中无 `deterministic_findings`），可改用提供的
+校验工具复核（例如把 `available_tools` 原样作为 `available_tools_json`
+传入 `check_plan_completeness`）；本工作流内部调用不提供工具。
+
+生成工具评审（`tool_review`）的通过/拒绝策略：
+   - 通过（passed=true）：功能正确且安全即通过——用途必要、名称规范
+     （snake_case、不与既有工具重名）、MCP 契约完整（name/description/
+     inputSchema 与实现入口一致）、安全边界达标（不得引用其他 Agent、
+     不得越出沙箱）、入口 `run()` 返回值为 JSON 可序列化；
+   - `test_cases` / `expected_outputs` 覆盖不全（如缺少边界用例）仅在
+     issues 中提醒改进，不作为拒绝理由——注册前的沙箱验收会逐用例
+     比对正确答案兜底；必要时可结合 `tool_necessity` 核对声明与授权
+     的对应关系；
+   - 拒绝（passed=false）：仅当存在功能错误（实现与用途明显不符）、
+     安全风险、名称严重不规范或 MCP 契约与实现不符时才拒绝。
+
+## 输出硬约束（覆盖上文输出格式段落）
+
+最终输出必须是 ReviewDecision 结构的纯 JSON 文本——不包裹 Markdown
+代码围栏（不要 ```json 标记），不附加任何解释性文字：
+
+```json
+{
+  "stage": "plan_review 或 result_review",
+  "passed": true,
+  "issues": ["发现的问题描述（无则空数组）"],
+  "suggestions": ["非阻断的改进建议（无则空数组）"],
+  "required_fixes": ["阻断性必须修复项（passed=false 时必填至少一条）"],
+  "retry_target": "需要重试的 subtask_id 或 agent_id；无需重试则为 null",
+  "summary": "结论摘要（含逐条验收标准核对结论）"
+}
+```
+
+- ReviewDecision 的 `stage` 字段只接受 `plan_review` / `result_review` 两个值；
+  当本次输入 `stage` 为 `authorization_review` 或 `tool_review` 时，输出 `stage`
+  必须填 `plan_review`，并在 `summary` 中注明“本次为授权最小化评审”或
+  “本次为生成工具评审”；
+- 字段契约（硬约束，违反将导致结论被判定为无效）：
+  - `passed` 是唯一放行字段，必须显式输出 true/false；
+  - `passed=true` 时 `required_fixes` 必须为空数组 `[]`；
+  - `passed=false` 时 `required_fixes` 必须至少包含一条修复项；
+  - `issues` 只写问题描述；非阻断的改进建议一律写入 `suggestions`，
+    不得放入 `required_fixes`；
+  - `suggestions` 非空不影响放行（仅提示性建议）；
+- 每个 `required_fixes` 条目应指向具体阻断问题并给出可操作建议；
+- `deterministic_findings` 仅作证据，结论必须独立作出且与证据一致。
+"""
+
+
+class ReviewStage(str, Enum):
+    """评审 Agent 可处理的阶段类型。"""
+
+    PLAN_REVIEW = "plan_review"                    # 计划评审
+    AUTHORIZATION_REVIEW = "authorization_review"  # 授权最小化评审（输出时映射为 plan_review）
+    TOOL_REVIEW = "tool_review"                    # 生成工具评审（输出时映射为 plan_review）
+    RESULT_REVIEW = "result_review"                # 结果评审
+
+
+class ReviewInput(BaseModel):
+    """评审 Agent 的输入契约（主 Agent 下发）。"""
+
+    stage: ReviewStage = Field(
+        description="评审阶段：plan_review/authorization_review/tool_review/result_review"
+    )
+    task_request: TaskRequest = Field(description="原始任务请求")
+    subtasks: list[SubtaskSpec] | None = Field(
+        default=None, description="待评审的子任务规格列表（计划/授权评审时提供）"
+    )
+    tool_grants: list[ToolGrant] | None = Field(
+        default=None, description="本次计划的工具授权列表（授权评审时提供）"
+    )
+    generated_tool: GeneratedToolManifest | None = Field(
+        default=None, description="待评审的生成工具清单（工具评审时提供）"
+    )
+    execution_results: list[ExecutionResult] | None = Field(
+        default=None, description="全部子任务的执行结果列表（结果评审时提供）"
+    )
+    available_tools: list[str] | None = Field(
+        default=None,
+        description="当前环境可用工具清单（计划评审时提供，供核对子任务声明工具是否越界）",
+    )
+    deterministic_findings: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "控制层预计算的确定性检查结果（plan_completeness / "
+            "tool_necessity / result_correctness），评审据此给出结论，"
+            "无需调用校验工具"
+        ),
+    )
+    plan_version: int = Field(default=1, description="当前计划版本号")
+
+
+# ---------------------------------------------------------------------------
+# 通用小工具（JSON 序列化 / 上下文解析 / 输入解析）
+# ---------------------------------------------------------------------------
+def _json(payload: Any) -> str:
+    """将载荷序列化为 JSON 字符串（工具返回值的统一格式）。"""
+    if isinstance(payload, BaseModel):
+        return payload.model_dump_json()
+    return json.dumps(payload, ensure_ascii=False, default=str)
+
+
+def _error(message: str, **fields: Any) -> str:
+    """构造失败形态的 JSON 工具返回值。"""
+    return _json({"status": "error", "error": message, **fields})
+
+
+def _resolve_context(context: ProjectContext | None) -> ProjectContext:
+    """返回生效的 ProjectContext；未提供时创建默认实例（cwd/sandbox）。"""
+    if context is not None:
+        return context
+    return ProjectContext(sandbox_dir=Path.cwd() / "sandbox", project_name="default")
+
+
+def _resolve_settings(context: ProjectContext, settings: Settings | None) -> Settings:
+    """返回生效配置：显式参数 > context.config > 全局配置。"""
+    if settings is not None:
+        return settings
+    return context.config if context.config is not None else get_settings()
+
+
+def _sandbox_root(context: ProjectContext) -> Path:
+    """返回项目沙箱根目录（绝对路径、已规范化）。"""
+    return Path(context.sandbox_dir).expanduser().resolve()
+
+
+def _is_within(root: Path, target: Path) -> bool:
+    """判断 target 是否位于 root 之内（Windows 大小写不敏感比较）。"""
+    root_text = os.path.normcase(str(root))
+    target_text = os.path.normcase(str(target))
+    return target_text == root_text or target_text.startswith(root_text + os.sep)
+
+
+def _budget_phrase(value: Any, unit: str) -> str:
+    """把预算配置格式化为提示词短语（<=0 表示不限制）。"""
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        limit = 0
+    return f"≤{limit}{unit}" if limit > 0 else "不限制"
+
+
+def _output_budget_instructions(settings: Settings | None) -> str:
+    """生成评审结论的输出预算段落（与运行时截断配置保持一致）。"""
+    def _value(name: str, default: int) -> Any:
+        return getattr(settings, name, default) if settings is not None else default
+
+    issues = _budget_phrase(_value("review_issues_max_items", 8), " 条")
+    suggestions = _budget_phrase(_value("review_suggestions_max_items", 8), " 条")
+    fixes = _budget_phrase(_value("review_required_fixes_max_items", 8), " 条")
+    item = _budget_phrase(_value("review_item_max_chars", 240), " 字符")
+    summary = _budget_phrase(_value("review_summary_max_chars", 400), " 字符")
+    return f"""
+## 输出预算（超出部分由控制层截断）
+
+- `issues` 最多 {issues}，每条 {item}；
+- `suggestions` 最多 {suggestions}，每条 {item}；
+- `required_fixes` 最多 {fixes}，每条 {item}；
+- `summary` {summary}，只写结论与关键依据，不复述输入；
+- 不粘贴执行结果全文、日志或代码；引用证据只给路径、字段名与关键值。
+"""
+
+
+def _load_prompt(settings: Settings | None = None) -> str:
+    """读取本目录 prompt.md 作为系统提示词（含契约与输出预算补充说明）。"""
+    text = PROMPT_PATH.read_text(encoding="utf-8")
+    return (
+        f"{text}\n\n{_EXTRA_INSTRUCTIONS}"
+        f"{_output_budget_instructions(settings)}"
+    )
+
+
+def _build_chat_model(config: AgentAPIConfig) -> Model:
+    """根据 api_config.yaml 构造模型；配置了 fallbacks 时启用故障转移。"""
+    return build_chat_model_with_gateway(
+        config,
+        config_path=resolve_api_config_path(API_CONFIG_PATH),
+        client_factory=AsyncOpenAI,
+    )
+
+
+async def _extract_output_json(result: RunResult | RunResultStreaming) -> str:
+    """``as_tool`` 输出提取器：保证工具返回值始终为 JSON 字符串。
+
+    Agent 以纯文本返回（``output_type=None``），字符串输出先剥离
+    Markdown 代码围栏提取 JSON 对象；无法结构化时回退为
+    ``{"output": ...}`` 文本包装。
+    """
+    output = result.final_output
+    if isinstance(output, BaseModel):
+        return output.model_dump_json()
+    if isinstance(output, (dict, list)):
+        return json.dumps(output, ensure_ascii=False, default=str)
+    if isinstance(output, str):
+        obj = extract_json_object(output)
+        if obj is not None:
+            return json.dumps(obj, ensure_ascii=False)
+    return json.dumps({"output": "" if output is None else str(output)}, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# 输入解析（工具参数一律为 JSON 文本；解析失败返回错误结构）
+# ---------------------------------------------------------------------------
+def _loads(value: str, *, label: str) -> Any:
+    """解析 JSON 文本参数。
+
+    Raises:
+        ValueError: 参数为空或不是合法 JSON 时。
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{label} 不能为空（应为 JSON 文本）")
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{label} 不是合法 JSON：{exc}") from exc
+
+
+def _as_text_list(value: Any, *, label: str) -> list[str]:
+    """把字符串（逗号/分号/换行分隔）或数组规范化为去空文本列表。"""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [
+            item.strip()
+            for item in re.split(r"[,;，；\n\r]+", value)
+            if item.strip()
+        ]
+    if isinstance(value, (list, tuple, set)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    raise ValueError(f"{label} 必须是字符串或字符串数组")
+
+
+def _mapping(item: Any, *, label: str, index: int) -> dict[str, Any]:
+    """校验列表元素为 JSON 对象并返回浅拷贝。"""
+    if not isinstance(item, dict):
+        raise ValueError(f"{label}[{index}] 必须是 JSON 对象")
+    return dict(item)
+
+
+def _parse_subtask_list(
+    value: str,
+) -> tuple[list[SubtaskSpec], list[dict[str, Any]]]:
+    """解析子任务列表 JSON（接受数组或 ``{"subtasks": [...]}`` 形态）。
+
+    评审工具常收到被模型精简过的子任务对象：缺失 title/instructions/
+    role 不影响重复 ID、依赖与工具范围等结构校验。此处对缺失的非结构
+    字段补空并返回补位清单（``[{"subtask_id", "missing"}]``），避免整个
+    工具因 Pydantic 必填字段缺失而失败；显式给出但为空的字段仍会被
+    ``check_plan_completeness`` 判定为空字段。
+    """
+    data = _loads(value, label="subtasks_json")
+    if isinstance(data, dict):
+        data = data.get("subtasks", [])
+    if not isinstance(data, list):
+        raise ValueError("subtasks_json 必须是 JSON 数组或含 subtasks 数组的对象")
+    specs: list[SubtaskSpec] = []
+    defaulted: list[dict[str, Any]] = []
+    for index, item in enumerate(data):
+        entry = _mapping(item, label="subtasks_json", index=index)
+        if "subtask_id" not in entry and "id" in entry:
+            entry["subtask_id"] = entry.get("id")
+        missing: list[str] = []
+        for key in ("subtask_id", "title", "instructions", "role"):
+            if entry.get(key) is None:
+                missing.append(key)
+                entry[key] = ""
+            else:
+                entry[key] = str(entry[key]).strip()
+        for key in ("dependencies", "allowed_tools", "write_scope"):
+            entry[key] = _as_text_list(
+                entry.get(key), label=f"subtasks_json[{index}].{key}"
+            )
+        spec = SubtaskSpec.model_validate(entry)
+        specs.append(spec)
+        if missing:
+            defaulted.append(
+                {
+                    "index": index,
+                    "subtask_id": spec.subtask_id,
+                    "missing": missing,
+                }
+            )
+    return specs, defaulted
+
+
+def _parse_grant_list(value: str) -> list[ToolGrant]:
+    """解析工具授权列表 JSON（接受数组或 ``{"tool_grants": [...]}`` 形态）。
+
+    缺失的标识与签发字段补空串（空 grant_id 会被判定为空授权），
+    ``allowed_tools`` 接受数组或分隔字符串；空的时间字段回退默认值。
+    """
+    data = _loads(value, label="grants_json")
+    if isinstance(data, dict):
+        data = data.get("tool_grants", data.get("grants", []))
+    if not isinstance(data, list):
+        raise ValueError("grants_json 必须是 JSON 数组或含 tool_grants 数组的对象")
+    grants: list[ToolGrant] = []
+    for index, item in enumerate(data):
+        entry = _mapping(item, label="grants_json", index=index)
+        if "grant_id" not in entry and "id" in entry:
+            entry["grant_id"] = entry.get("id")
+        for key in ("grant_id", "task_id", "agent_id", "issued_by"):
+            entry[key] = "" if entry.get(key) is None else str(entry[key]).strip()
+        entry["allowed_tools"] = _as_text_list(
+            entry.get("allowed_tools"),
+            label=f"grants_json[{index}].allowed_tools",
+        )
+        for key in ("issued_at", "expires_at"):
+            if entry.get(key) in ("", None):
+                entry.pop(key, None)
+        grants.append(ToolGrant.model_validate(entry))
+    return grants
+
+
+def _parse_result_list(
+    value: str,
+) -> tuple[list[ExecutionResult], list[dict[str, Any]]]:
+    """解析执行结果列表 JSON（接受数组或 ``{"results": [...]}`` 形态）。
+
+    缺失 ``success`` 的结果按失败处理（fail-closed）并记入补位清单，
+    不以"无错误即成功"的推断放行；非字符串 output 序列化为 JSON 文本。
+    """
+    data = _loads(value, label="results_json")
+    if isinstance(data, dict):
+        data = data.get("execution_results", data.get("results", []))
+    if not isinstance(data, list):
+        raise ValueError("results_json 必须是 JSON 数组或含 results 数组的对象")
+    results: list[ExecutionResult] = []
+    defaulted: list[dict[str, Any]] = []
+    for index, item in enumerate(data):
+        entry = _mapping(item, label="results_json", index=index)
+        if "subtask_id" not in entry and "id" in entry:
+            entry["subtask_id"] = entry.get("id")
+        entry["subtask_id"] = (
+            "" if entry.get("subtask_id") is None else str(entry["subtask_id"]).strip()
+        )
+        missing: list[str] = []
+        if "success" not in entry:
+            entry["success"] = False
+            missing.append("success")
+        output = entry.get("output")
+        if output is not None and not isinstance(output, str):
+            entry["output"] = json.dumps(output, ensure_ascii=False, default=str)
+        for key in ("evidence", "artifacts"):
+            entry[key] = _as_text_list(
+                entry.get(key), label=f"results_json[{index}].{key}"
+            )
+        if entry.get("duration") in ("", None):
+            entry.pop("duration", None)
+        if entry.get("error") is not None and not isinstance(entry["error"], str):
+            entry["error"] = str(entry["error"])
+        result = ExecutionResult.model_validate(entry)
+        results.append(result)
+        if missing:
+            defaulted.append(
+                {"subtask_id": result.subtask_id, "missing": missing}
+            )
+    return results, defaulted
+
+
+def _parse_criteria(value: str) -> list[str]:
+    """解析验收标准（JSON 字符串/数组/键值对象，或纯文本多行列表）。"""
+    if not isinstance(value, str) or not value.strip():
+        return []
+    try:
+        data = json.loads(value)
+    except json.JSONDecodeError:
+        # 模型常直接回传验收标准原文（非 JSON）：按行/分号拆分
+        return [
+            item.strip()
+            for item in re.split(r"[\n\r;；]+", value)
+            if item.strip()
+        ]
+    if isinstance(data, str):
+        return [data]
+    if isinstance(data, list):
+        return [str(item) for item in data if str(item).strip()]
+    if isinstance(data, dict):
+        return [f"{key}: {item}" for key, item in data.items()]
+    return [str(data)]
+
+
+def _parse_available_tools(value: str) -> list[str] | None:
+    """解析可用工具清单 JSON（字符串数组；空/非法输入或空列表返回 None，
+    表示未提供，调用方据此跳过工具越界检查）。纯文本分隔清单也可接受。"""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        data = json.loads(value)
+    except json.JSONDecodeError:
+        items = [
+            item.strip()
+            for item in re.split(r"[,;，；\n\r]+", value)
+            if item.strip()
+        ]
+        return items or None
+    if isinstance(data, dict):
+        data = data.get("available_tools", data.get("tools", []))
+    if isinstance(data, str):
+        data = _as_text_list(data, label="available_tools_json")
+    if not isinstance(data, list):
+        return None
+    items = [str(item).strip() for item in data if str(item).strip()]
+    return items if items else None
+
+
+def _detect_cycles(specs: list[SubtaskSpec]) -> list[str]:
+    """用 Kahn 算法检测依赖环，返回无法完成拓扑排序的 subtask_id（含环成员）。"""
+    ids = [spec.subtask_id for spec in specs]
+    id_set = set(ids)
+    indegree: dict[str, int] = {sid: 0 for sid in ids}
+    dependents: dict[str, list[str]] = {sid: [] for sid in ids}
+    for spec in specs:
+        for dep in spec.dependencies:
+            if dep in id_set and dep != spec.subtask_id:
+                indegree[spec.subtask_id] += 1
+                dependents[dep].append(spec.subtask_id)
+    queue = [sid for sid in ids if indegree[sid] == 0]
+    resolved: set[str] = set()
+    while queue:
+        current = queue.pop(0)
+        resolved.add(current)
+        for nxt in dependents[current]:
+            indegree[nxt] -= 1
+            if indegree[nxt] == 0:
+                queue.append(nxt)
+    return sorted(sid for sid in ids if sid not in resolved)
+
+
+def _flat_tools(specs: Iterable[SubtaskSpec]) -> set[str]:
+    """汇总全部子任务声明的工具白名单（去重）。"""
+    return {tool for spec in specs for tool in spec.allowed_tools if tool.strip()}
+
+
+# ---------------------------------------------------------------------------
+# 确定性检查（控制层预计算，与工具入口共用同一实现）
+# ---------------------------------------------------------------------------
+def compute_plan_completeness(
+    specs: list[SubtaskSpec],
+    available_tools: list[str] | None = None,
+    *,
+    defaulted: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """检查任务拆解的完整性，返回 JSON 兼容的结果字典。
+
+    控制层在调用评审 Agent 前直接调用本函数；工具入口仅做 JSON 解析
+    与结果序列化，二者共用同一判定口径。
+    """
+    ids = [spec.subtask_id for spec in specs]
+    id_set = set(ids)
+    duplicates = sorted({sid for sid in ids if ids.count(sid) > 1})
+    skipped_fields = {item["index"]: set(item["missing"]) for item in defaulted or []}
+    empty_fields: list[dict[str, Any]] = []
+    for index, spec in enumerate(specs):
+        missing = [
+            name
+            for name, value in (
+                ("title", spec.title),
+                ("instructions", spec.instructions),
+                ("role", spec.role),
+            )
+            if name not in skipped_fields.get(index, set())
+            and not str(value).strip()
+        ]
+        if missing:
+            empty_fields.append({"subtask_id": spec.subtask_id, "missing": missing})
+    self_dependencies = sorted(
+        spec.subtask_id for spec in specs if spec.subtask_id in spec.dependencies
+    )
+    missing_dependencies = [
+        {
+            "subtask_id": spec.subtask_id,
+            "missing": sorted(dep for dep in spec.dependencies if dep not in id_set),
+        }
+        for spec in specs
+        if any(dep not in id_set for dep in spec.dependencies)
+    ]
+    cyclic_ids = _detect_cycles(specs)
+
+    # 工具越界检查（仅提醒不构成失败）：available_tools 未提供时跳过
+    out_of_scope_tools: list[str] = []
+    if available_tools is not None:
+        available_set = set(available_tools)
+        out_of_scope_tools = sorted(
+            tool for tool in _flat_tools(specs) if tool not in available_set
+        )
+
+    notes: list[str] = []
+    if not specs:
+        notes.append("子任务清单为空：计划评审不可能通过，请要求主 Agent 重新拆解。")
+    if defaulted:
+        notes.append(
+            "部分非结构字段未随工具输入提供（"
+            + ", ".join(
+                f"{item['subtask_id'] or '<空>'}:{'/'.join(item['missing'])}"
+                for item in defaulted[:5]
+            )
+            + "），对应字段的完整性提示已跳过，请基于原始计划核对；"
+            "显式给出但为空的字段仍计入 empty_fields。"
+        )
+    if missing_dependencies:
+        notes.append("存在依赖不存在的子任务：请核对 subtask_id 拼写或补充缺失子任务。")
+    if cyclic_ids:
+        notes.append("依赖图存在环：必须调整依赖关系后才能执行。")
+    if out_of_scope_tools:
+        notes.append(
+            "存在不在可用工具列表中的声明工具：若为待创建的动态工具属正常流程；"
+            "若运行环境无法提供，请在 issues 中指出并建议替代方案。"
+        )
+    passed = bool(specs) and not (
+        duplicates or empty_fields or self_dependencies or missing_dependencies or cyclic_ids
+    )
+
+    return {
+        "status": "ok",
+        "subtask_count": len(specs),
+        "duplicate_ids": duplicates,
+        "empty_fields": empty_fields,
+        "self_dependencies": self_dependencies,
+        "missing_dependencies": missing_dependencies,
+        "cyclic_ids": cyclic_ids,
+        "out_of_scope_tools": out_of_scope_tools,
+        "passed": passed,
+        "notes": notes,
+    }
+
+
+def compute_tool_necessity(
+    specs: list[SubtaskSpec], grants: list[ToolGrant]
+) -> dict[str, Any]:
+    """检查工具授权的必要性与最小化。"""
+    declared = _flat_tools(specs)
+    granted = {tool for grant in grants for tool in grant.allowed_tools if tool.strip()}
+    over_granted = sorted(granted - declared)
+    under_granted = sorted(declared - granted)
+    empty_grants = [
+        grant.grant_id or "<missing>"
+        for grant in grants
+        if not grant.allowed_tools or not grant.grant_id.strip()
+    ]
+    suspicious = sorted(tool for tool in granted if tool.lower() in _SUSPICIOUS_TOOLS)
+
+    notes: list[str] = []
+    if over_granted:
+        notes.append("存在超出子任务声明的授权工具：须核验是否为必要最小化，否则应收紧授权。")
+    if under_granted:
+        notes.append("提示：存在声明但尚未授权的工具，主管应在执行前补发授权；若为动态工具，将在执行阶段创建后自动授权。")
+    if empty_grants:
+        notes.append("存在空授权条目：空授权不产生任何放行能力，应删除或补全。")
+    if suspicious:
+        notes.append("存在宽泛/高风险工具名：必须重点核验必要性，必要时要求替换为细粒度工具。")
+
+    passed = not (over_granted or empty_grants or suspicious)
+    return {
+        "status": "ok",
+        "declared_tools": sorted(declared),
+        "granted_tools": sorted(granted),
+        "over_granted": over_granted,
+        "under_granted": under_granted,
+        "empty_grants": empty_grants,
+        "suspicious_tools": suspicious,
+        "passed": passed,
+        "notes": notes,
+    }
+
+
+def compute_result_correctness(
+    results: list[ExecutionResult],
+    criteria: list[str],
+    sandbox_root: Path,
+    *,
+    defaulted: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """检查执行结果的正确性：失败项、证据完整性、产物越界与验收清单。"""
+    failed = [
+        {"subtask_id": result.subtask_id, "error": result.error}
+        for result in results
+        if not result.success
+    ]
+    empty_output = [
+        result.subtask_id
+        for result in results
+        if result.success and not result.output.strip()
+    ]
+    missing_evidence = [
+        result.subtask_id
+        for result in results
+        if result.success and not result.evidence
+    ]
+    artifact_violations: list[dict[str, str]] = []
+    for result in results:
+        for artifact in result.artifacts:
+            try:
+                path = Path(artifact)
+                target = (
+                    path.resolve()
+                    if path.is_absolute()
+                    else (sandbox_root / path).resolve()
+                )
+                if not _is_within(sandbox_root, target):
+                    artifact_violations.append(
+                        {"subtask_id": result.subtask_id, "artifact": artifact}
+                    )
+            except OSError:
+                artifact_violations.append(
+                    {"subtask_id": result.subtask_id, "artifact": artifact}
+                )
+
+    notes: list[str] = []
+    if defaulted:
+        notes.append(
+            "部分结果缺少 success 字段（"
+            + ", ".join(item["subtask_id"] or "<空>" for item in defaulted[:5])
+            + "），已按未成功处理（fail-closed），请结合原始结果核对。"
+        )
+    if failed:
+        notes.append("存在失败子任务：结论不应为通过，应给出重试目标与修复要求。")
+    if empty_output:
+        notes.append("存在成功但无文本产出的子任务：须核验其证据链是否闭环。")
+    if missing_evidence:
+        notes.append("存在无证据的成功结果：证据缺失的断言按未通过处理，不得放行。")
+    if artifact_violations:
+        notes.append("存在沙箱目录之外的产物路径：属于越界痕迹，必须重点核验并可能判定不通过。")
+    if not criteria:
+        notes.append("未提供验收标准：无法逐条核对，请要求主 Agent 补充 TaskRequest.acceptance_criteria。")
+
+    passed = not (failed or artifact_violations or missing_evidence or empty_output)
+    return {
+        "status": "ok",
+        "result_count": len(results),
+        "failed_subtasks": failed,
+        "empty_output": empty_output,
+        "missing_evidence": missing_evidence,
+        "artifact_violations": artifact_violations,
+        "criteria": criteria,
+        "criteria_total": len(criteria),
+        "passed": passed,
+        "notes": notes,
+    }
+
+
+def build_deterministic_findings(
+    review_input: ReviewInput, sandbox_root: Path
+) -> dict[str, Any]:
+    """按评审阶段预计算确定性检查，供评审 Agent 直接作为证据使用。
+
+    控制层在调用评审 Agent 前完成这些检查，评审只需一轮模型调用即可
+    给出结论；失败时返回 ``status=error`` 条目，由评审 Agent 按证据
+    不完整处理，不影响主流程。
+    """
+    findings: dict[str, Any] = {}
+    specs = review_input.subtasks
+    try:
+        if specs is not None and review_input.stage in (
+            ReviewStage.PLAN_REVIEW,
+            ReviewStage.AUTHORIZATION_REVIEW,
+        ):
+            findings["plan_completeness"] = compute_plan_completeness(
+                specs, review_input.available_tools
+            )
+        if specs is not None and (
+            review_input.stage == ReviewStage.TOOL_REVIEW
+            or review_input.tool_grants is not None
+        ):
+            findings["tool_necessity"] = compute_tool_necessity(
+                specs, list(review_input.tool_grants or [])
+            )
+        if (
+            review_input.stage == ReviewStage.RESULT_REVIEW
+            and review_input.execution_results is not None
+        ):
+            findings["result_correctness"] = compute_result_correctness(
+                list(review_input.execution_results),
+                list(review_input.task_request.acceptance_criteria),
+                Path(sandbox_root).expanduser().resolve(),
+            )
+    except Exception as exc:  # 确定性检查失败不得阻断评审本身
+        findings["error"] = f"{type(exc).__name__}: {exc}"
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# 内部工具构建
+# ---------------------------------------------------------------------------
+def build_review_tools(
+    context: ProjectContext | None = None,
+    *,
+    settings: Settings | None = None,
+) -> dict[str, FunctionTool]:
+    """构造评审 Agent 的全部内部校验工具（以工具名索引的字典）。
+
+    Args:
+        context: 共享上下文；未提供时使用默认沙箱目录（cwd/sandbox）。
+        settings: 生效配置；校验工具为纯逻辑实现，该参数为接口一致性保留。
+
+    Returns:
+        ``{工具名: FunctionTool}``，包含 check_plan_completeness /
+        check_tool_necessity / check_result_correctness 三个工具。
+    """
+    resolved_context = _resolve_context(context)
+    sandbox_root = _sandbox_root(resolved_context)
+
+    @function_tool
+    def check_plan_completeness(
+        ctx: RunContextWrapper[Any],
+        subtasks_json: str,
+        available_tools_json: str = "[]",
+    ) -> str:
+        """检查任务拆解的完整性：重复 ID、空字段、依赖缺失、自依赖与循环依赖，
+        以及子任务声明的 allowed_tools 是否都在可用工具列表中。
+
+        Args:
+            subtasks_json: 子任务规格列表的 JSON 文本（SubtaskSpec 数组，或
+                含 subtasks 数组的对象）。
+            available_tools_json: 当前环境可用工具清单的 JSON 文本（字符串
+                数组，取自 ReviewInput.available_tools）；未提供或为空时
+                跳过工具越界检查。
+
+        Returns:
+            JSON 字符串：包含 ``duplicate_ids`` / ``empty_fields`` /
+            ``self_dependencies`` / ``missing_dependencies`` / ``cyclic_ids``
+            / ``out_of_scope_tools``（声明但不在可用工具列表中的工具，仅
+            提醒不构成失败）/ ``passed``（结构完整性无问题才为 true）与
+            ``notes``；输入非法时返回 ``{"status": "error", "error"}``。
+        """
+        try:
+            specs, defaulted = _parse_subtask_list(subtasks_json)
+        except (ValueError, ValidationError) as exc:
+            return _error(f"subtasks_json 校验失败：{exc}")
+        return _json(
+            compute_plan_completeness(
+                specs,
+                _parse_available_tools(available_tools_json),
+                defaulted=defaulted,
+            )
+        )
+
+    @function_tool
+    def check_tool_necessity(ctx: RunContextWrapper[Any], subtasks_json: str, grants_json: str) -> str:
+        """检查工具授权的必要性与最小化：超额授权、空授权、可疑宽泛工具与授权缺口。
+
+        Args:
+            subtasks_json: 子任务规格列表的 JSON 文本（可为空数组）。
+            grants_json: 工具授权列表的 JSON 文本（ToolGrant 数组）。
+
+        Returns:
+            JSON 字符串：包含 ``over_granted``（授权超出子任务声明的工具）、
+            ``under_granted``（声明但未授权的工具）、``empty_grants``（空授权
+            grant_id）、``suspicious_tools``（宽泛高风险工具名）、``passed``
+            与 ``notes``；输入非法时返回 ``{"status": "error", "error"}``。
+        """
+        try:
+            specs, _ = _parse_subtask_list(subtasks_json)
+        except (ValueError, ValidationError) as exc:
+            return _error(f"subtasks_json 校验失败：{exc}")
+        try:
+            grants = _parse_grant_list(grants_json)
+        except (ValueError, ValidationError) as exc:
+            return _error(f"grants_json 校验失败：{exc}")
+        return _json(compute_tool_necessity(specs, grants))
+
+    @function_tool
+    def check_result_correctness(ctx: RunContextWrapper[Any], results_json: str, criteria_json: str) -> str:
+        """检查执行结果的正确性：失败项、证据完整性、产物路径越界与验收标准清单。
+
+        Args:
+            results_json: 执行结果列表的 JSON 文本（ExecutionResult 数组）。
+            criteria_json: 验收标准的 JSON 文本（字符串 / 字符串数组 / 键值对象）。
+
+        Returns:
+            JSON 字符串：包含 ``failed_subtasks`` / ``empty_output`` /
+            ``missing_evidence`` / ``artifact_violations``（产物路径越界）/
+            ``criteria`` 与 ``criteria_total`` / ``passed`` 与 ``notes``；
+            输入非法时返回 ``{"status": "error", "error"}``。
+        """
+        try:
+            results, defaulted = _parse_result_list(results_json)
+        except (ValueError, ValidationError) as exc:
+            return _error(f"results_json 校验失败：{exc}")
+        try:
+            criteria = _parse_criteria(criteria_json)
+        except (ValueError, json.JSONDecodeError) as exc:
+            return _error(f"criteria_json 校验失败：{exc}")
+        return _json(
+            compute_result_correctness(
+                results, criteria, sandbox_root, defaulted=defaulted
+            )
+        )
+
+    return {
+        "check_plan_completeness": check_plan_completeness,
+        "check_tool_necessity": check_tool_necessity,
+        "check_result_correctness": check_result_correctness,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 工厂函数
+# ---------------------------------------------------------------------------
+def create_review_agent(
+    context: ProjectContext | None = None,
+    *,
+    settings: Settings | None = None,
+    model: str | Model | None = None,
+    with_tools: bool = False,
+) -> Agent[Any]:
+    """构造配置完毕的评审 Agent（SDK Agent 实例）。
+
+    Args:
+        context: 共享上下文；未提供时使用默认沙箱目录（cwd/sandbox）。
+        settings: 生效配置；未提供时取 context.config（再回退全局配置）。
+        model: 模型实例或名称覆盖；未提供时按本包 api_config.yaml 构造
+            （密钥优先取 api_key 直接值，回退 api_key_env 环境变量，
+            均缺失时抛 ConfigLoadError）。
+        with_tools: 是否绑定内部校验工具。工作流内部调用默认 False——
+            控制层已把确定性检查结果放进 ``deterministic_findings``，
+            评审只需一轮模型调用；外部 MCP / as_tool 入口传 True 以保留
+            自主复核能力。
+
+    Returns:
+        ``Agent`` 实例：name="review_agent"，instructions 取自 prompt.md，
+        不设置 output_type（None，纯文本返回）：评审结论由调用方剥离
+        Markdown 围栏后按 ``ReviewDecision`` 手动校验（MCP 适配层与
+        workflow 控制层均内置该容错路径）。
+    """
+    resolved_context = _resolve_context(context)
+    resolved_settings = _resolve_settings(resolved_context, settings)
+    resolved_model = model or _build_chat_model(
+        load_agent_api_config(resolve_api_config_path(API_CONFIG_PATH))
+    )
+    tools = (
+        list(build_review_tools(resolved_context, settings=resolved_settings).values())
+        if with_tools
+        else []
+    )
+    return Agent(
+        name=AGENT_NAME,
+        instructions=_load_prompt(resolved_settings),
+        tools=tools,
+        model=resolved_model,
+        # output_type 保持 None（纯文本返回）：千问等兼容接口忽略
+        # response_format=json_schema 时 SDK 严格校验会抛 ModelBehaviorError，
+        # 改由调用方手动剥离围栏 + ReviewDecision 校验。
+    )
+
+
+def get_review_agent_as_tool(
+    context: ProjectContext | None = None,
+    *,
+    settings: Settings | None = None,
+    model: str | Model | None = None,
+) -> FunctionTool:
+    """将评审 Agent 转为主 Agent 可直接调用的工具入口（Agent.as_tool）。
+
+    Args:
+        context: 共享上下文；未提供时使用默认沙箱目录（cwd/sandbox）。
+        settings: 生效配置；未提供时取 context.config（再回退全局配置）。
+        model: 模型实例或名称覆盖；未提供时按本包 api_config.yaml 构造。
+
+    Returns:
+        ``FunctionTool``：工具名 "review_agent"，返回值经输出提取器规范化为
+        结构化 JSON 字符串。
+    """
+    resolved_context = _resolve_context(context)
+    resolved_settings = _resolve_settings(resolved_context, settings)
+    agent = create_review_agent(
+        resolved_context,
+        settings=resolved_settings,
+        model=model,
+        with_tools=True,
+    )
+    return agent.as_tool(
+        tool_name=AGENT_NAME,
+        tool_description=_TOOL_DESCRIPTION,
+        custom_output_extractor=_extract_output_json,
+        max_turns=resolved_settings.max_model_turns,
+    )
+
+
+def get_mcp_schema() -> MCPToolSchema:
+    """返回评审 Agent 的 MCP 暴露契约（MCPToolSchema）。
+
+    inputSchema 取自 ``ReviewInput.model_json_schema()``。
+    """
+    return MCPToolSchema(
+        name=AGENT_NAME,
+        description=_TOOL_DESCRIPTION,
+        inputSchema=ReviewInput.model_json_schema(),
+    )
+
+
+def get_mcp_server(
+    context: ProjectContext | None = None,
+    *,
+    settings: Settings | None = None,
+    model: str | Model | None = None,
+) -> MCPToolServer:
+    """将评审 Agent 包装为 MCP Server（供主管与 MCPClient 统一调用）。
+
+    与 ``get_review_agent_as_tool`` 等价的 MCP 暴露形态：调用时按
+    ``ReviewInput`` 校验参数、运行 Agent，并按 ``ReviewDecision``
+    提取结构化 JSON 文本。
+
+    Args:
+        context: 共享上下文；未提供时使用默认沙箱目录（cwd/sandbox）。
+        settings: 生效配置；未提供时取 context.config（再回退全局配置）。
+        model: 模型实例或名称覆盖；未提供时按本包 api_config.yaml 构造。
+
+    Returns:
+        ``MCPToolServer``：name="review_agent"，含单个工具的 MCP Server。
+    """
+    resolved_context = _resolve_context(context)
+    resolved_settings = _resolve_settings(resolved_context, settings)
+    agent = create_review_agent(
+        resolved_context,
+        settings=resolved_settings,
+        model=model,
+        with_tools=True,
+    )
+    return agent_to_mcp_server(
+        agent,
+        AGENT_NAME,
+        _TOOL_DESCRIPTION,
+        ReviewInput,
+        ReviewDecision,
+        max_turns=resolved_settings.max_model_turns,
+        usage_recorder=make_usage_recorder(resolved_context, "review_agent"),
+        output_max_chars=int(
+            getattr(resolved_settings, "tool_output_max_chars", 0) or 0
+        ),
+        settings=resolved_settings,
+        activity_hook=resolved_context.report_activity,
+    )

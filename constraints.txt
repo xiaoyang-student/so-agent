@@ -1,0 +1,15 @@
+# 已验证版本约束（direct dependencies plus the test stack）。
+# 用途：CI 与 Docker 构建时通过 `-c constraints.txt` 固定直接依赖，
+# 避免上游小版本漂移导致行为变化。这是约束集而非哈希锁；完整可复现
+# 依赖树仍建议在发布流程中用干净虚拟环境生成 lock 文件。
+openai-agents==0.22.3
+openai==3.26.0
+pydantic==2.12.5
+pydantic-settings==2.3.0
+json-repair==0.63.5
+PyYAML==6.0.3
+python-statemachine==3.2.1
+fastapi==0.115.0
+uvicorn==0.54.0
+pytest==9.1.1
+pytest-asyncio==1.4.0

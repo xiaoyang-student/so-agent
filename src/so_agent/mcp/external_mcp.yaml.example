@@ -1,0 +1,17 @@
+# 外部 MCP 接入配置示例（默认关闭；复制为 external_mcp.yaml 并显式开启）
+#
+# 安全约束：url 默认必须为 https；allowed_hosts 只支持精确主机名；
+# allowed_tools 为空视为配置非法（默认拒绝全部工具）；不跟随重定向；
+# 默认拒绝解析到内网/回环/保留地址的主机。
+enabled: false
+servers: []
+# servers:
+#   - name: market-search
+#     url: https://mcp.example.com/rpc
+#     allowed_hosts: [mcp.example.com]
+#     allowed_tools: [search_docs]
+#     timeout_seconds: 30
+#     max_response_bytes: 1000000
+#     max_request_bytes: 1000000
+#     allow_insecure_http: false
+#     allow_private_network: false

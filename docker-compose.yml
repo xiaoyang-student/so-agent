@@ -1,0 +1,24 @@
+services:
+  so-agent-web:
+    build: .
+    image: so-agent-web:local
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8765:8765"
+    environment:
+      # 两项均为必填：缺少时 compose 直接拒绝启动。
+      SO_AGENT_API_KEY: ${SO_AGENT_API_KEY:?set SO_AGENT_API_KEY}
+      SO_AGENT_WEB_AUTH_TOKEN: ${SO_AGENT_WEB_AUTH_TOKEN:?set SO_AGENT_WEB_AUTH_TOKEN}
+      SO_AGENT_SANDBOX_BACKEND: local
+      SO_AGENT_WEB_SANDBOX_DIR: /app/sandbox/web
+      SO_AGENT_WEB_RESULTS_DIR: /app/results
+      SO_AGENT_WEB_KEEP_HISTORY: ${SO_AGENT_WEB_KEEP_HISTORY:-false}
+    volumes:
+      - so-agent-sandbox:/app/sandbox
+      - so-agent-results:/app/results
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  so-agent-sandbox:
+  so-agent-results:

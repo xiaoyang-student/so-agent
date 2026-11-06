@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# API 配置（含密钥）
+**/api_config.yaml
+secrets.yaml
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 沙箱运行产物（忽略全部内容，仅保留目录占位文件）
+sandbox/*
+!sandbox/.gitkeep
+
+# 本地工具目录（mimocode）
+.mimocode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 测试缓存
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 运行日志
+logs/
+
+# 运行时工具库产物（mcp_servers 的说明与配置仍纳入版本管理）
+tools/generated/
+tools/archive/
+tools/verified_scripts/
+
+# 本地运行数据
+results/
+*.db
+*.db-wal
+*.db-shm
+*.log
+
+# 本地环境与工具缓存
+.env
+.hallmark/
