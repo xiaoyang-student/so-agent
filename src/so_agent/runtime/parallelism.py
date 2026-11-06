@@ -22,7 +22,7 @@ from typing import Any, Iterable, Mapping, Sequence
 # 处理（fail-closed），防止两个子任务并发改写同一文件造成返工。
 READ_ONLY_TOOLS: frozenset[str] = frozenset({"read_file"})
 
-# 判定阈值（与 docs/生产化重构设计.md 的五道闸门一致）
+# 判定阈值（多 Agent 启用的五道闸门）
 MIN_FAN_OUT_WIDTH: int = 3
 NET_GAIN_THRESHOLD: float = 1.3
 COORDINATION_COST: float = 0.25

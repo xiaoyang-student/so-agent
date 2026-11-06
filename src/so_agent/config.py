@@ -319,7 +319,7 @@ class Settings(BaseSettings):
     # ---- 插件（外部能力可选加载）----
     # 目录约定：{plugins_dir}/{kind}/{name}/plugin.yaml。仅加载显式启用
     # 的插件；为空表示只用内置能力。沙箱插件注册后可用
-    # sandbox_backend=<name> 选择。详见 docs/插件化规范.md。
+    # sandbox_backend=<name> 选择。插件契约见各插件目录内的 plugin.yaml。
     plugins_dir: str = "plugins"
     plugins_enabled: str = ""              # 逗号分隔插件 id；"*" 表示加载目录内全部
     plugins_require_hash: bool = False     # 强制入口文件 SHA-256 钉住
