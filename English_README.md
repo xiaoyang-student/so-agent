@@ -6,6 +6,11 @@
 
 <h1 align="center">SO-Agent</h1>
 <p align="center">
+  <a href="https://github.com/xiaoyang-student/so-agent/actions/workflows/ci.yml"><img src="https://github.com/xiaoyang-student/so-agent/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License"></a>
+  <img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+">
+</p>
+<p align="center">
   <b>A Governed Multi-Agent Execution Runtime</b><br>
   <i>LLMs think, Code decides.</i>
 </p>
@@ -299,7 +304,7 @@ The process exits with code 1 if any case fails, so the same set can gate CI or 
 
 ## CI and Container Deployment
 
-- **CI**: `.github/workflows/ci.yml` installs dependencies, compiles bytecode, runs the sandbox doctor, the full test suite, and a wheel build on Ubuntu / Windows / macOS with Python 3.10 and 3.13; `constraints.txt` pins validated versions. The repository is not yet connected to a remote CI, so the workflow itself has not actually run on GitHub.
+- **CI**: `.github/workflows/ci.yml` installs dependencies, compiles bytecode, runs the sandbox doctor, the full test suite, and a wheel build on Ubuntu / Windows / macOS with Python 3.10 and 3.13; `constraints.txt` pins validated versions. The repository is wired to GitHub Actions.
 - **Container**: the `Dockerfile` runs the Web console as a non-root user, and `docker-compose.yml` maps the console to a loopback port and requires `SO_AGENT_API_KEY` plus `SO_AGENT_WEB_AUTH_TOKEN`. The container has no nested container runtime, so the code sandbox is fixed to `local` (path isolation only, not a security boundary); run on the host with `sandbox_backend=docker/podman` when container-level code isolation is required.
 
 ```bash

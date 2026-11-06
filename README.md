@@ -6,6 +6,11 @@
 
 <h1 align="center">SO-Agent</h1>
 <p align="center">
+  <a href="https://github.com/xiaoyang-student/so-agent/actions/workflows/ci.yml"><img src="https://github.com/xiaoyang-student/so-agent/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License"></a>
+  <img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+">
+</p>
+<p align="center">
   <b>受控的多 Agent 执行运行时</b><br>
   <i>LLM 负责思考，代码负责决策。</i>
 </p>
@@ -285,7 +290,7 @@ python scripts/quality_regression.py --category instruction_following
 
 ## CI 与容器部署
 
-- **CI**：`.github/workflows/ci.yml` 在 Ubuntu / Windows / macOS 三平台、Python 3.10 与 3.13 上执行安装、字节码编译、沙箱 doctor、全量测试与 wheel 构建；依赖通过 `constraints.txt` 固定已验证版本。仓库尚未接入远端 CI，工作流本身尚未在 GitHub 上实际跑过。
+- **CI**：`.github/workflows/ci.yml` 在 Ubuntu / Windows / macOS 三平台、Python 3.10 与 3.13 上执行安装、字节码编译、沙箱 doctor、全量测试与 wheel 构建；依赖通过 `constraints.txt` 固定已验证版本。仓库已接入 GitHub Actions。
 - **容器**：`Dockerfile` 以非 root 用户运行 Web 控制台，`docker-compose.yml` 对本机回环端口映射并强制要求 `SO_AGENT_API_KEY` 与 `SO_AGENT_WEB_AUTH_TOKEN`。容器内没有嵌套容器运行时，因此代码沙箱固定为 `local`（仅路径隔离，不是安全边界）；需要容器级代码隔离时应在宿主机运行并使用 `sandbox_backend=docker/podman`。
 
 ```bash
