@@ -141,7 +141,7 @@ The diagram intentionally includes only implemented capabilities. The following 
 
 ## Core Features (Implemented)
 
-All capabilities below are implemented in the current code and covered by **2032 tests (current snapshot)**:
+All capabilities below are implemented in the current code and covered by **2036 tests (current snapshot)**:
 
 - **Four-quadrant task routing**: rule-based pre-check plus one lightweight LLM classification; tasks are dispatched along the complexity × duration quadrants to direct answer / deep reasoning / persistent task / full workflow paths. Classification failure conservatively degrades to the full workflow.
 - **Two-tier star architecture**: the Supervisor Agent exclusively holds exactly three tool entries (code_agent, subagent_creator, review_agent); subagents have no message channels or shared sessions — all communication is relayed by the Supervisor.
@@ -171,9 +171,9 @@ All capabilities below are implemented in the current code and covered by **2032
 - **Context and output governance**: per-phase Supervisor payload pruning (`prune_empty`) with per-phase payload audit (characters, estimated tokens, largest fields); a shallow sandbox artifact index is injected into code/dynamic subagents; deterministic compression preserves identifiers, paths, and verification rules; tool outputs and code-agent reports are truncated by configurable caps, and code bodies are no longer echoed twice with diffs (`code_agent_suppress_diff_echo`).
 - **Cost and output governance**: direct-answer and deep-reasoning paths support output token caps (`direct_answer_max_tokens` / `deep_reasoning_max_tokens`; `<=0` disables); task-level token budgets are enabled by default (800k per task and 400k per agent, with a non-retryable failure at the next safe checkpoint when exceeded); `/api/health` returns the same ops details as `/api/metrics` (including compatibility fields `tasks` / `sandbox_backend` / `token_budget`) when no token is configured (loopback-only) or a valid token is supplied; with a token configured, unauthenticated calls receive only readiness and the auth flag. Full cost/time multidimensional budgets and context governance remain deferred.
 - **Human escalation notifications**: optional secure webhook on `human_required` (disabled by default, HTTPS only, private networks rejected by default, token read only from the environment); bounded retries (network errors / 429 / 5xx with exponential backoff), a stable idempotency key, and optional HMAC-SHA256 signatures. With `notification_outbox_enabled`, notifications are first persisted to a dedicated SQLite outbox and drained by the Web process or CLI daemon with backoff; `/api/health` exposes queue backlog and oldest pending age.
-- **Plugin-based capability extension**: sandbox, LLM, MCP, rules, and observability share one plugin directory layout (`plugins/<kind>/<name>/plugin.yaml`); only explicitly enabled external plugins are loaded, and unknown manifest fields, undeclared permissions, plaintext secrets, API-version mismatches, out-of-root entry points, or digest mismatches refuse startup. Built-in implementations are registered as plugins first, and an external plugin with the same id cannot override one. See `docs/插件化规范.md`.
+- **Plugin-based capability extension**: sandbox, LLM, MCP, rules, and observability share one plugin directory layout (`plugins/<kind>/<name>/plugin.yaml`); only explicitly enabled external plugins are loaded, and unknown manifest fields, undeclared permissions, plaintext secrets, API-version mismatches, out-of-root entry points, or digest mismatches refuse startup. Built-in implementations are registered as plugins first, and an external plugin with the same id cannot override one. The layout is defined by each plugin's `plugin.yaml`.
 - **Optional orchestration runtime**: `orchestration_runtime=native` (default) uses the existing `WorkflowEngine`; `langgraph` is an optional outer adapter (task-granularity hosting, lazy import) that fails at startup when its dependency is absent, so the kernel takes no hard dependency. The phased state machine, human escalation, and checkpoint semantics are unchanged.
-- **High-risk action approval gate**: disabled by default; when enabled, `run_in_sandbox` calls matching network, subprocess, deletion, or privilege-escalation risk patterns first persist an approval record (idempotent per task/tool/parameters) and wait for a decision through the Web console `GET/POST /api/approvals` or the notification outbox/webhook. Rejection, timeout, or a record error fails the call; approval records survive process restarts and remain visible and decidable after a Web restart. See `docs/编排运行时与审批门.md`.
+- **High-risk action approval gate**: disabled by default; when enabled, `run_in_sandbox` calls matching network, subprocess, deletion, or privilege-escalation risk patterns first persist an approval record (idempotent per task/tool/parameters) and wait for a decision through the Web console `GET/POST /api/approvals` or the notification outbox/webhook. Rejection, timeout, or a record error fails the call; approval records survive process restarts and remain visible and decidable after a Web restart.
 - **Bilingual Web console**: menus, statuses, messages, and API errors switch between Chinese and English (`?lang=en`).
 
 ## Installation
@@ -246,7 +246,7 @@ Notes:
 
 ### Sandbox Preparation (Windows 10/11 / Linux / macOS)
 
-The default `sandbox_backend=auto` uses container isolation when Docker/Podman is detected; otherwise it falls back to the local validation sandbox and records a warning. For production or untrusted code, require isolation explicitly:
+The default `sandbox_backend=auto` uses container isolation when Docker/Podman is detected; otherwise it falls back to the local validation sandbox and records a warning. The default image is a Linux image, so a Docker daemon that only serves Windows containers is skipped by `auto` (explicitly selecting `sandbox_backend=docker` fails instead); switch it to Linux container mode. For production or untrusted code, require isolation explicitly:
 
 ```powershell
 # Windows 10 (2004+) / Windows 11: detect and guide installation of Docker Desktop or Podman
@@ -283,7 +283,7 @@ The container backend uses `--network none`, a read-only root filesystem, `--cap
 .\.venv\Scripts\python.exe -m pytest
 ```
 
-The suite currently collects **2032 tests (current snapshot)**, all using fake models with no real API consumption by default; real end-to-end tests require a key and are executed separately.
+The suite currently collects **2036 tests (current snapshot)**, all using fake models with no real API consumption by default; real end-to-end tests require a key and are executed separately.
 
 ### Fixed quality regression set and instruction-following scoring
 
@@ -438,9 +438,4 @@ Four-quadrant routing; thin WorkflowEngine and three coordinators; 13-phase shad
 
 - [SO_Agent_Execution_Runtime.md](./SO_Agent_Execution_Runtime.md): English architecture document — original design rationale and actual evolution, layering, state model, data structures, permissions, configuration, and test plan.
 - [多_Agent_框架.md](./多_Agent_框架.md): Chinese architecture document (section-for-section and capability-status aligned with the English version).
-- [docs/基准与稳定性报告.md](./docs/基准与稳定性报告.md): real-LLM token / latency / retry baseline and the same-task comparison against the native API and web client (historical measurement record, Chinese).
-- [docs/改造路线.md](./docs/改造路线.md): 1.4 acceptance criteria, phased steps, per-file change list, and execution record (Chinese).
-- [docs/生产化重构设计.md](./docs/生产化重构设计.md): production target shape, module split, open-source selection, and migration route (partially implemented, Chinese).
-- [docs/插件化规范.md](./docs/插件化规范.md): plugin contracts and how sandbox, LLM, MCP, rules, and observability capabilities plug in (Chinese).
-- [docs/编排运行时与审批门.md](./docs/编排运行时与审批门.md): orchestration-runtime selection and the high-risk action approval gate before tool calls (Chinese).
 - Configuration examples: [src/so_agent/api_config.yaml.example](./src/so_agent/api_config.yaml.example) and `src/so_agent/tool_packages/<agent>/api_config.yaml.example`.

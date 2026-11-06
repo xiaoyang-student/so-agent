@@ -60,6 +60,34 @@ def test_auto_without_fallback_fails_closed(tmp_path: Path, monkeypatch) -> None
         )
 
 
+def test_auto_skips_windows_container_runtime(tmp_path: Path, monkeypatch) -> None:
+    runtime = ContainerRuntime(
+        name="docker", executable="docker", version="27.0", os_type="windows"
+    )
+    monkeypatch.setattr(
+        sandbox_module, "detect_container_runtime", lambda *a, **k: runtime
+    )
+    sandbox = create_sandbox(sandbox_dir=tmp_path, settings=_settings())
+    assert isinstance(sandbox, SandboxRunner)
+
+
+def test_explicit_docker_rejects_windows_container_runtime(
+    tmp_path: Path, monkeypatch
+) -> None:
+    runtime = ContainerRuntime(
+        name="docker", executable="docker", version="27.0", os_type="windows"
+    )
+    monkeypatch.setattr(
+        sandbox_module, "detect_container_runtime", lambda *a, **k: runtime
+    )
+    with pytest.raises(SandboxBackendError) as excinfo:
+        create_sandbox(
+            sandbox_dir=tmp_path,
+            settings=_settings(sandbox_backend="docker"),
+        )
+    assert "Windows 容器" in str(excinfo.value)
+
+
 def test_doctor_report_and_backend_resolution() -> None:
     settings = _settings(sandbox_backend="local")
     report = doctor_report(settings)
@@ -170,3 +198,31 @@ def test_container_command_has_security_flags(tmp_path: Path) -> None:
         "/work/task_t1/run_r1/main.py",
     ]
     assert str(cidfile).endswith(".container_id")
+
+
+def test_stage_tool_is_mounted_readonly(tmp_path: Path) -> None:
+    runtime = ContainerRuntime(name="docker", executable="docker", version="27.0")
+    sandbox = ContainerSandbox(
+        sandbox_dir=tmp_path,
+        settings=Settings(sandbox_container_image="python:3.12-slim"),
+        runtime=runtime,
+    )
+    source = tmp_path / "generated" / "demo_tool.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("def run(**kwargs):\n    return kwargs\n", encoding="utf-8")
+
+    staged = sandbox.stage_tool(source)
+    assert staged.parts[0] in ("/", "\\")
+    assert staged.parts[1] == "staged"
+    assert staged.name == "demo_tool.py"
+    assert (tmp_path / "_staged" / staged.parts[2] / staged.name).is_file()
+
+    run_dir = tmp_path / "task_t1" / "run_r1"
+    run_dir.mkdir(parents=True)
+    command, _ = sandbox._build_command(
+        task_id="t1", run_id="r1", run_dir=run_dir, workspace=run_dir
+    )
+    joined = " ".join(command)
+    assert f"source={tmp_path / '_staged'}" in joined
+    assert "target=/staged" in joined
+    assert "target=/staged,readonly" in joined

@@ -484,15 +484,16 @@ class TestConcurrentReplacements:
         assert len(env.deps.scheduler.replacement_requests) == 2
 
         # 1) 全局 FSM：记录在案的每次迁移都在允许集合内（并发交错下
-        #    同状态迁移按既有语义 no-op，不产生非法转换）
+        #    全局状态是单值摘要：两条替代链的 requested/executing 与
+        #    completed 后的 executing 可任意交错，同状态迁移按既有语义
+        #    no-op）
         transitions = status_transitions(env.context)
         assert transitions[0] == ("received", "executing")
+        allowed_states = {"executing", "replacement_requested", "replacement_executing"}
         for pair in transitions[1:]:
-            assert pair in {
-                ("executing", "replacement_requested"),
-                ("replacement_requested", "replacement_executing"),
-                ("replacement_executing", "executing"),
-            }, f"非法全局迁移：{pair}"
+            assert pair[0] in allowed_states and pair[1] in allowed_states, (
+                f"非法全局迁移：{pair}"
+            )
         assert transitions[-1][1] == "executing"
         # 影子状态机活性由专用确定性交错测试覆盖（下测）：协调器级
         # 简化环境影子图从 idle 起（真实流水线经规划/评审/授权阶段

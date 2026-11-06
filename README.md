@@ -122,7 +122,7 @@ flowchart TB
 
 ## 核心特性（已实现）
 
-以下能力均已在当前代码中实现，并经 **2032 项测试（当前快照）** 覆盖验证：
+以下能力均已在当前代码中实现，并经 **2036 项测试（当前快照）** 覆盖验证：
 
 - **四象限任务路由**：规则预判 + 一次轻量 LLM 分类，按「复杂度 × 时长」将任务分发到直接回答 / 深度推理 / 持久化任务 / 完整工作流四条路径；分类失败时保守降级为完整工作流。
 - **两层星型架构**：主管 Agent 独占且仅持有三个工具入口（code_agent、subagent_creator、review_agent）；子 Agent 之间无消息通道、无共享会话，一切通信经主管 Agent 中转。
@@ -153,9 +153,9 @@ flowchart TB
 - **上下文与输出治理**：主管载荷按阶段裁剪并剔除空字段（`prune_empty`），完整载荷逐阶段记录字符数、估算 token 与最大字段（`context_payload_audit`）；向代码/动态子 Agent 注入沙箱浅层文件索引（`artifact_index_in_prompt`）；确定性压缩（不做语义摘要）保护编号、路径、验收规则等关键字段不被截断；工具输出与代码 Agent 回报按上限截断（`tool_output_max_chars` / `code_agent_output_max_chars`），并抑制代码正文与 diff 重复回显（`code_agent_suppress_diff_echo`）。
 - **成本与输出治理**：直接回答与深度推理路径支持输出 token 上限（`direct_answer_max_tokens` / `deep_reasoning_max_tokens`，`<=0` 关闭）；任务级 token 预算默认启用（单任务 80 万、单 Agent 40 万双阈值，超限在下一安全检查点直接失败且不重试）；`/api/health` 在未配置令牌（仅回环访问）或携带有效令牌时返回与 `/api/metrics` 同源的运维详情（含兼容字段 `tasks` / `sandbox_backend` / `token_budget`），配置令牌后的未鉴权请求仅返回就绪状态与是否要求鉴权。完整成本/时间多维预算与上下文治理仍暂缓。
 - **人工升级通知**：`human_required` 时可选投递安全 Webhook（默认关闭，仅 HTTPS、默认拒绝内网、令牌只读环境变量）；支持有界重试（网络错误 / 429 / 5xx，指数退避）、稳定幂等键与可选 HMAC-SHA256 签名。启用 `notification_outbox_enabled` 后通知先写入独立 SQLite，再由 Web 进程或 CLI 守护进程的后台任务按退避排空，`/api/health` 暴露队列积压与最老等待时长。
-- **插件化能力扩展**：沙箱、LLM、MCP、规则、观测五类能力统一为插件目录（`plugins/<kind>/<name>/plugin.yaml`）；仅加载显式启用的外部插件，清单未知字段、未声明权限、明文密钥、API 版本不符、入口越界与摘要不匹配一律拒绝启动。内置实现先登记为插件，外部插件与内置插件同 id 时拒绝覆盖。规范见 `docs/插件化规范.md`。
+- **插件化能力扩展**：沙箱、LLM、MCP、规则、观测五类能力统一为插件目录（`plugins/<kind>/<name>/plugin.yaml`）；仅加载显式启用的外部插件，清单未知字段、未声明权限、明文密钥、API 版本不符、入口越界与摘要不匹配一律拒绝启动。内置实现先登记为插件，外部插件与内置插件同 id 时拒绝覆盖。规范见各插件目录内的 `plugin.yaml`。
 - **可选编排运行时**：默认 `orchestration_runtime=native` 直接使用现有 `WorkflowEngine`；`langgraph` 为可选外层适配器（任务粒度托管、惰性导入），未安装依赖时启动失败，内核不引入硬依赖。分阶段状态机、人工兜底与检查点语义保持不变。
-- **高风险动作审批门**：默认关闭；启用后 `run_in_sandbox` 命中网络、子进程、删除、提权等风险模式时先落盘审批记录（按任务/工具/参数幂等），经 Web 控制台 `GET/POST /api/approvals` 或通知 outbox/Webhook 决定后执行；拒绝、超时或记录异常一律按失败返回，审批记录跨进程保留，Web 重启后可继续查看与决定。说明见 `docs/编排运行时与审批门.md`。
+- **高风险动作审批门**：默认关闭；启用后 `run_in_sandbox` 命中网络、子进程、删除、提权等风险模式时先落盘审批记录（按任务/工具/参数幂等），经 Web 控制台 `GET/POST /api/approvals` 或通知 outbox/Webhook 决定后执行；拒绝、超时或记录异常一律按失败返回，审批记录跨进程保留，Web 重启后可继续查看与决定。
 - **中英双语界面**：Web 控制台菜单、状态、提示与 API 错误支持中英切换（`?lang=en`）。
 
 ## 安装
@@ -228,7 +228,7 @@ python -m so_agent.main "用一句话解释二分查找的时间复杂度"
 
 ### 沙箱准备（Windows 10/11 / Linux / macOS）
 
-默认 `sandbox_backend=auto`：检测到 Docker/Podman 时使用容器隔离；否则回退到本地验证型沙箱并记录警告。生产或运行不可信代码时应显式要求隔离：
+默认 `sandbox_backend=auto`：检测到 Docker/Podman 时使用容器隔离；否则回退到本地验证型沙箱并记录警告。默认镜像是 Linux 镜像，因此仅支持 Windows 容器的 Docker 会被 `auto` 跳过（显式指定 `sandbox_backend=docker` 会直接失败），请切换到 Linux 容器模式。生产或运行不可信代码时应显式要求隔离：
 
 ```powershell
 # Windows 10 (2004+) / Windows 11：检测并引导安装 Docker Desktop 或 Podman
@@ -265,7 +265,7 @@ SO_AGENT_SANDBOX_CONTAINER_IMAGE=python:3.12-slim
 .\.venv\Scripts\python.exe -m pytest
 ```
 
-当前收集 **2032 项测试（当前快照）**，默认全部使用假模型，不消耗真实 API；真实端到端测试需提供密钥后单独执行。
+当前收集 **2036 项测试（当前快照）**，默认全部使用假模型，不消耗真实 API；真实端到端测试需提供密钥后单独执行。
 
 ### 固定质量回归集与指令遵循评分
 
@@ -446,9 +446,4 @@ docker compose cp so-agent-web:/app/results/latest.md ./latest.md
 
 - [多_Agent_框架.md](./多_Agent_框架.md)：中文架构文档——原始总体设计思想与实际演进、分层、状态模型、数据结构、权限、配置与测试计划。
 - [SO_Agent_Execution_Runtime.md](./SO_Agent_Execution_Runtime.md)：English architecture document（与中文版章节和能力状态一一对应）。
-- [docs/基准与稳定性报告.md](./docs/基准与稳定性报告.md)：真实 LLM 的 token / 耗时 / 重试基线，以及与原生 API、网页端的同题对比（历史测量记录）。
-- [docs/改造路线.md](./docs/改造路线.md)：1.4 改造的验收口径、分阶段步骤、逐文件清单与执行记录。
-- [docs/生产化重构设计.md](./docs/生产化重构设计.md)：生产化目标形态、模块拆分、开源选型与迁移路线（部分已实施）。
-- [docs/插件化规范.md](./docs/插件化规范.md)：插件契约与沙箱、LLM、MCP、规则、观测五类能力的接入方式。
-- [docs/编排运行时与审批门.md](./docs/编排运行时与审批门.md)：编排运行时选择与工具调用前的高风险动作审批门。
 - 配置示例：[src/so_agent/api_config.yaml.example](./src/so_agent/api_config.yaml.example) 及 `src/so_agent/tool_packages/<agent>/api_config.yaml.example`。

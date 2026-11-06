@@ -200,6 +200,7 @@ def _create_docker_backend(
             "Docker 后端不可用：未找到 docker 命令或 Docker daemon 未启动；"
             "请运行 `so-agent-sandbox doctor` 检查"
         )
+    _ensure_linux_runtime(runtime)
     return ContainerSandbox(
         context=context,
         sandbox_dir=sandbox_dir,
@@ -207,6 +208,15 @@ def _create_docker_backend(
         python_executable=python_executable,
         runtime=runtime,
     )
+
+
+def _ensure_linux_runtime(runtime: object) -> None:
+    """默认沙箱镜像为 Linux 镜像：明确选用 Windows 容器运行时会被拒绝。"""
+    if getattr(runtime, "os_type", "") == "windows":
+        raise SandboxBackendError(
+            f"{getattr(runtime, 'name', 'container')} 当前使用 Windows 容器，"
+            "无法运行 Linux 沙箱镜像；请切换到 Linux 容器模式或改用 local 后端"
+        )
 
 
 def _create_podman_backend(
@@ -222,6 +232,7 @@ def _create_podman_backend(
             "Podman 后端不可用：未找到 podman 命令或 Podman machine 未启动；"
             "请运行 `so-agent-sandbox doctor` 检查"
         )
+    _ensure_linux_runtime(runtime)
     return ContainerSandbox(
         context=context,
         sandbox_dir=sandbox_dir,
@@ -240,6 +251,12 @@ def _create_auto_backend(
 ) -> SandboxBackend:
     resolved = _resolve_backend_settings(context, settings)
     runtime = detect_container_runtime("auto")
+    windows_only = (
+        runtime is not None and getattr(runtime, "os_type", "") == "windows"
+    )
+    if windows_only:
+        # 默认镜像是 Linux 镜像；Windows 容器运行时保留给显式 backend 选择
+        runtime = None
     if runtime is not None:
         return ContainerSandbox(
             context=context,
@@ -248,20 +265,30 @@ def _create_auto_backend(
             python_executable=python_executable,
             runtime=runtime,
         )
+    detail = (
+        "检测到的容器运行时仅支持 Windows 容器，无法运行 Linux 沙箱镜像"
+        if windows_only
+        else "未检测到 Docker/Podman"
+    )
     if resolved.sandbox_require_isolation:
         raise SandboxBackendError(
-            "未检测到 Docker/Podman，且 sandbox_require_isolation=True："
-            "拒绝回退到本地验证型沙箱。请安装容器运行时后重试"
+            f"{detail}，且 sandbox_require_isolation=True："
+            "拒绝回退到本地验证型沙箱。请配置 Linux 容器运行时后重试"
         )
     if not resolved.sandbox_allow_local_fallback:
         raise SandboxBackendError(
-            "未检测到 Docker/Podman，且 sandbox_allow_local_fallback=False："
-            "没有可用沙箱后端"
+            f"{detail}，且 sandbox_allow_local_fallback=False：没有可用沙箱后端"
         )
-    logger.warning(
-        "未检测到 Docker/Podman，回退到本地验证型沙箱（非安全隔离）；"
-        "生产环境请安装容器运行时并设置 sandbox_require_isolation=True"
-    )
+    if windows_only:
+        logger.warning(
+            "检测到的容器运行时仅支持 Windows 容器，无法运行 Linux 沙箱镜像；"
+            "回退到本地验证型沙箱（非安全隔离）"
+        )
+    else:
+        logger.warning(
+            "未检测到 Docker/Podman，回退到本地验证型沙箱（非安全隔离）；"
+            "生产环境请安装容器运行时并设置 sandbox_require_isolation=True"
+        )
     return SandboxRunner(
         context=context,
         sandbox_dir=sandbox_dir,

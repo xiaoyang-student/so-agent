@@ -986,7 +986,7 @@ class TestSupervisorBudget:
         )
         stub = self._stub_object(settings, gate)
         budget = WorkflowEngine._supervisor_budget(stub)
-        assert 9.0 <= budget < 10.0
+        assert 9.0 <= budget <= 10.0
 
     def test_unlimited_total_still_clamped_by_pipeline_deadline(self):
         # 主管不设总预算，但部署方显式开启 pipeline deadline 时仍受剩余约束
@@ -994,7 +994,9 @@ class TestSupervisorBudget:
         gate.set_deadline(time.monotonic() + 10.0)
         stub = self._stub_object(Settings(max_pipeline_timeout=100.0), gate)
         budget = WorkflowEngine._supervisor_budget(stub)
-        assert 9.0 <= budget < 10.0
+        # Windows 的 monotonic 分辨率较粗，两次取时刻可能落在同一刻度，
+        # 剩余恰好等于 10.0，故上界取闭区间
+        assert 9.0 <= budget <= 10.0
 
     def test_budget_covers_nested_subagent_window(self):
         # 显式开启各层上限时保持旧的不变量

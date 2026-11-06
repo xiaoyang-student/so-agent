@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -43,6 +44,9 @@ class ContainerRuntime:
     name: str
     executable: str
     version: str = ""
+    # 容器操作系统类型（docker info 的 OSType）；默认镜像为 Linux 镜像，
+    # Windows 容器运行时无法执行，auto 选择时需据此跳过。
+    os_type: str = ""
 
 
 class ContainerSandboxError(SandboxError):
@@ -63,7 +67,7 @@ def _probe_runtime(name: str, executable: str) -> ContainerRuntime | None:
     try:
         if name == "docker":
             result = _run_probe(
-                [executable, "info", "--format", "{{.ServerVersion}}"]
+                [executable, "info", "--format", "{{.ServerVersion}}|{{.OSType}}"]
             )
         else:
             result = _run_probe(
@@ -73,11 +77,14 @@ def _probe_runtime(name: str, executable: str) -> ContainerRuntime | None:
         return None
     if result.returncode != 0:
         return None
-    version = (result.stdout or "").strip().splitlines()
+    lines = (result.stdout or "").strip().splitlines()
+    raw = lines[0].strip() if lines else ""
+    version, _, os_type = raw.partition("|")
     return ContainerRuntime(
         name=name,
         executable=executable,
-        version=version[0] if version else "",
+        version=version.strip(),
+        os_type=(os_type.strip().lower() or ("linux" if name == "podman" else "")),
     )
 
 
@@ -155,6 +162,24 @@ class ContainerSandbox:
     def runtime(self) -> ContainerRuntime:
         assert self._runtime is not None
         return self._runtime
+
+    def stage_tool(self, path: str | Path) -> Path:
+        """把生成工具源码复制到只读 `_staged` 目录并返回容器内路径。
+
+        生成工具运行器把入口文件路径直接嵌入源码，因此容器内必须能
+        按同一路径读取；`_staged` 以只读方式挂载到 ``/staged``。目录按
+        内容哈希命名，同一版本工具重复调用只占用一份副本。
+        """
+        source = Path(path)
+        if not source.is_file():
+            raise ContainerSandboxError(f"待交付的生成工具不存在：{source}")
+        digest = hashlib.sha256(source.read_bytes()).hexdigest()[:16]
+        staged_dir = self._root / "_staged" / digest
+        staged_dir.mkdir(parents=True, exist_ok=True)
+        target = staged_dir / source.name
+        if not target.is_file():
+            shutil.copy2(source, target)
+        return Path("/staged") / digest / source.name
 
     def _resolve_run_dir(self, task_id: str, run_id: str) -> Path:
         return resolve_run_dir(self._root, task_id, run_id, _ID_PATTERN)
@@ -338,6 +363,14 @@ class ContainerSandbox:
         command.extend(
             [self._image, self._python, f"/work/{main_rel}"]
         )
+        staged_root = self._root / "_staged"
+        if staged_root.is_dir():
+            # stage_tool 交付的生成工具只读挂载，容器内路径与返回值一致
+            mount_at = command.index("--workdir")
+            command[mount_at:mount_at] = [
+                "--mount",
+                f"type=bind,source={staged_root},target=/staged,readonly",
+            ]
         return command, cidfile
 
     async def _kill_container(self, cidfile: Path, name: str) -> None:

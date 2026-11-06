@@ -1,10 +1,10 @@
 # 多 Agent 框架结构蓝图（SO-Agent 受控执行运行时）
 
-> **文档性质与状态标注约定**：本档保留立项时的原始总体设计思想，并逐章补充「实际演进」记录代码落地后的真实形态。能力一律使用四级标注：**【已实现】**（当前代码已有且经测试覆盖）、**【部分实现】**（核心在位、边界有限）、**【暂缓】**（设计理念保留、当前不做）、**【规划中】**（尚未实施）。英文对应文档 [SO_Agent_Execution_Runtime.md](./SO_Agent_Execution_Runtime.md) 与本档章节及能力状态一一对应。测试数与能力声明均为当前代码快照（2032 项测试），不构成永久承诺。
+> **文档性质与状态标注约定**：本档保留立项时的原始总体设计思想，并逐章补充「实际演进」记录代码落地后的真实形态。能力一律使用四级标注：**【已实现】**（当前代码已有且经测试覆盖）、**【部分实现】**（核心在位、边界有限）、**【暂缓】**（设计理念保留、当前不做）、**【规划中】**（尚未实施）。英文对应文档 [SO_Agent_Execution_Runtime.md](./SO_Agent_Execution_Runtime.md) 与本档章节及能力状态一一对应。测试数与能力声明均为当前代码快照（2036 项测试），不构成永久承诺。
 
 ## 〇、实现状态总览
 
-**已实现（2032 项测试，当前快照）**：四象限任务路由；薄 WorkflowEngine 与规划/执行/汇总三协调器；13 阶段影子 FSM；两阶段评审（`passed` 唯一放行 + fail closed + `suggestions` 非阻断）；授权 proposal 后置签发与全出口撤销；星型通信隔离；显式 `reuse_from` 复用；五层流式超时；PipelineGate 停止门；工具 timeout profile；SQLite schema 顺序增量迁移；FailureClassifier；失败指纹与去重；RecoveryPolicy；provider 禁替代；FORMAT 单次受限契约修复后 REPLAN；低信任 Agent 文本不可伪造系统失败；SQLite 持久化（任务 / Execution / PlanVersion / 事件日志）；可插拔沙箱后端（Docker / Podman 容器隔离、本地验证沙箱、云端预留）与隔离自检 CLI；MCP 协议层（protocol / server / client / adapter）；动态工具生成与 test_cases 语义验收；持久化调度守护进程（cron 时区、coalesce / catch_up / skip 错过策略、单任务失败退避重试、逐次运行历史）；ModelGateway 多供应商故障转移；可选跨任务防篡改审计链；可选 OpenTelemetry 追踪（工作流 / 分类 / 子任务 / 路径与模型调用 span）。
+**已实现（2036 项测试，当前快照）**：四象限任务路由；薄 WorkflowEngine 与规划/执行/汇总三协调器；13 阶段影子 FSM；两阶段评审（`passed` 唯一放行 + fail closed + `suggestions` 非阻断）；授权 proposal 后置签发与全出口撤销；星型通信隔离；显式 `reuse_from` 复用；五层流式超时；PipelineGate 停止门；工具 timeout profile；SQLite schema 顺序增量迁移；FailureClassifier；失败指纹与去重；RecoveryPolicy；provider 禁替代；FORMAT 单次受限契约修复后 REPLAN；低信任 Agent 文本不可伪造系统失败；SQLite 持久化（任务 / Execution / PlanVersion / 事件日志）；可插拔沙箱后端（Docker / Podman 容器隔离、本地验证沙箱、云端预留）与隔离自检 CLI；MCP 协议层（protocol / server / client / adapter）；动态工具生成与 test_cases 语义验收；持久化调度守护进程（cron 时区、coalesce / catch_up / skip 错过策略、单任务失败退避重试、逐次运行历史）；ModelGateway 多供应商故障转移；可选跨任务防篡改审计链；可选 OpenTelemetry 追踪（工作流 / 分类 / 子任务 / 路径与模型调用 span）。
 
 **部分实现**：验证型沙箱（仅路径隔离，非安全边界）；人工兜底（HumanEscalationHandler 接口与 `human_required` 状态，可选安全 Webhook 通知，支持重试 / 幂等键 / HMAC 签名，并可选用持久化 SQLite outbox 由 Web 进程或 CLI 守护进程后台排空；仍无人工工作台或工单回写端）；事件记录（结构化事件 + 本地日志文件 + 可选 SHA-256 哈希链 SQLite 审计库；跨任务查询 API 与检测尾部截断所需外部锚点仍属规划中）。
 
@@ -550,7 +550,7 @@ so-agent/
 - 【已实现】沙箱测试：验证代码写入、子进程执行、输出捕获、失败退出和超时终止。
 - 【部分实现】真实端到端测试：在提供 API 密钥后执行一个完整任务，并确认最终结果经过两阶段评审；此类测试需真实密钥，不在默认测试集内。
 
-**现状**：当前测试集共 **2032 项（当前快照）** 全部可离线通过；该数字随代码演进变化，不作为永久能力保证。
+**现状**：当前测试集共 **2036 项（当前快照）** 全部可离线通过；该数字随代码演进变化，不作为永久能力保证。
 
 ## 十二、分阶段落地（进度对照）
 

@@ -47,11 +47,27 @@ def _restore_backend_registry():
     _BACKEND_FACTORIES.update(snapshot)
 
 
-def test_default_backend_is_local_runner(tmp_path: Path) -> None:
-    sandbox = create_sandbox(sandbox_dir=tmp_path, settings=Settings())
+def test_local_backend_is_runner(tmp_path: Path) -> None:
+    sandbox = create_sandbox(
+        sandbox_dir=tmp_path, settings=Settings(sandbox_backend="local")
+    )
     assert isinstance(sandbox, SandboxRunner)
     assert isinstance(sandbox, SandboxBackend)
     assert sandbox.sandbox_root == tmp_path.resolve()
+
+
+def test_default_auto_backend_prefers_linux_container(tmp_path: Path) -> None:
+    from so_agent.runtime.sandbox_container import (
+        ContainerSandbox,
+        detect_container_runtime,
+    )
+
+    runtime = detect_container_runtime()
+    sandbox = create_sandbox(sandbox_dir=tmp_path, settings=Settings())
+    if runtime is None or runtime.os_type == "windows":
+        assert isinstance(sandbox, SandboxRunner)
+    else:
+        assert isinstance(sandbox, ContainerSandbox)
 
 
 def test_settings_select_backend(tmp_path: Path) -> None:

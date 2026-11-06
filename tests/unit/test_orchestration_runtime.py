@@ -78,4 +78,9 @@ def test_unknown_runtime_name_fails_closed() -> None:
     with pytest.raises(OrchestrationRuntimeError):
         create_orchestration_runtime(FakeEngine(), backend="unknown")
     ensure_runtime_available("native")
-    ensure_runtime_available("langgraph")
+    if importlib.util.find_spec("langgraph") is None:
+        # 可选依赖未安装时必须启动期失败，而不是运行时才暴露
+        with pytest.raises(OrchestrationRuntimeError):
+            ensure_runtime_available("langgraph")
+    else:
+        ensure_runtime_available("langgraph")

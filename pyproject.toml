@@ -25,6 +25,7 @@ dependencies = [
     "json-repair>=0.30",
     "pyyaml",
     "python-statemachine>=3.0",
+    "tzdata>=2024.1",
 ]
 
 [project.optional-dependencies]
