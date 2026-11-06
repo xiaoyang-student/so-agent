@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import httpx
+import httpx2
 import pytest
 import yaml
 from openai import APIConnectionError
@@ -52,7 +52,7 @@ class FakeServerError(Exception):
 
 def _connection_error() -> APIConnectionError:
     return APIConnectionError(
-        request=httpx.Request("POST", "https://primary.example/v1/chat/completions")
+        request=httpx2.Request("POST", "https://primary.example/v1/chat/completions")
     )
 
 
