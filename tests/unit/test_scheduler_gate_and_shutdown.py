@@ -27,6 +27,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from so_agent.config import Settings
 from so_agent.models import AgentRecord, ExecutionResult, SubtaskSpec
 from so_agent.runtime.budget import BudgetViolation, TokenBudgetExceeded
 from so_agent.runtime.scheduler import (
@@ -166,14 +167,18 @@ class TestParentCancellation:
             try:
                 await asyncio.sleep(30)
             except asyncio.CancelledError:
-                # 取消投递后立即正常返回：避免第二次挂起在 3.10/3.11 间
-                # 语义不同导致用例结果依赖解释器版本
                 return ExecutionResult(
                     subtask_id=task_spec.subtask_id, success=True, output="saved"
                 )
             return _ok(task_spec)
 
-        scheduler = SubtaskDAGScheduler(executor)
+        # 关闭子任务墙钟预算：默认 900s 会让执行器被 wait_for 包裹，而
+        # 3.10 的 wait_for 在取消时会强制 re-raise CancelledError（3.11+
+        # 直接 await 内层 task），吞取消并返回结果的路径在 3.10 不可达；
+        # 无墙钟预算时外层直接 await 执行器，两个版本语义一致
+        scheduler = SubtaskDAGScheduler(
+            executor, settings=Settings(subtask_max_wall_seconds=0.0)
+        )
         schedule_task = asyncio.create_task(scheduler.schedule("t1", [spec("a")]))
         await asyncio.sleep(0.05)
         schedule_task.cancel()
