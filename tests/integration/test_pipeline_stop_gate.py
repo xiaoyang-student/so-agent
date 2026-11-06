@@ -142,8 +142,10 @@ class TestPipelineTimeoutStopsEverything:
         # 停止门已原子进入 stopping（pipeline_timeout 首因保留）
         assert engine._gate.stopping is True
         assert engine._gate.stop_reason == "pipeline_timeout"
-        # 剩余预算永不为负
-        assert engine._gate.remaining() == 0.0
+        # 剩余预算永不为负；Windows 的 monotonic 粒度约 16ms，到期判定与
+        # 此处读数可能落在同一 tick 内，允许一个 tick 的正残差
+        remaining = engine._gate.remaining()
+        assert 0.0 <= remaining < 0.05
         # 执行链零新增 dispatch：只发生了 s1 的执行调用，s2 从未发起
         assert dispatch_inputs, "s1 应已进入执行链"
         assert not any('"s2"' in item for item in dispatch_inputs)

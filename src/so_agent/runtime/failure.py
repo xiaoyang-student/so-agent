@@ -146,7 +146,7 @@ _ISO_TIMESTAMP_RE = re.compile(
 _WINDOWS_PATH_RE = re.compile(r"[a-z]:\\[^\s\"']+")
 _POSIX_PATH_RE = re.compile(r"/(?:[^/\s\"']+/)+[^/\s\"']*")
 _LONG_HEX_RE = re.compile(r"\b[0-9a-f]{16,}\b")
-_NUMBER_RE = re.compile(r"\d+")
+_NUMBER_RE = re.compile(r"\d+(?:\.\d+)?")
 _WHITESPACE_RE = re.compile(r"\s+")
 
 

@@ -1036,7 +1036,9 @@ class TestTimeoutAudit:
         assert payload["timeout_kind"] == "phase_idle"
         assert payload["phase"] == "first_event"
         assert payload["configured_timeout"] == 0.05
-        assert payload["elapsed"] >= 0.05
+        # elapsed 由 time.monotonic 差分得出；Windows 的时钟粒度约 16ms，
+        # 单个 tick 的欠计合法，允许一个粒度内的偏差
+        assert 0.05 - 0.02 <= payload["elapsed"] < 1.0
         assert payload["wait_window"] == 0.05
         assert payload["agent_total_timeout"] == 5.0
         assert payload["agent"] == "subagent"

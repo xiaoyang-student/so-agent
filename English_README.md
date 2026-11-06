@@ -141,7 +141,7 @@ The diagram intentionally includes only implemented capabilities. The following 
 
 ## Core Features (Implemented)
 
-All capabilities below are implemented in the current code and covered by **2036 tests (current snapshot)**:
+All capabilities below are implemented in the current code and covered by **2037 tests (current snapshot)**:
 
 - **Four-quadrant task routing**: rule-based pre-check plus one lightweight LLM classification; tasks are dispatched along the complexity × duration quadrants to direct answer / deep reasoning / persistent task / full workflow paths. Classification failure conservatively degrades to the full workflow.
 - **Two-tier star architecture**: the Supervisor Agent exclusively holds exactly three tool entries (code_agent, subagent_creator, review_agent); subagents have no message channels or shared sessions — all communication is relayed by the Supervisor.
@@ -283,7 +283,7 @@ The container backend uses `--network none`, a read-only root filesystem, `--cap
 .\.venv\Scripts\python.exe -m pytest
 ```
 
-The suite currently collects **2036 tests (current snapshot)**, all using fake models with no real API consumption by default; real end-to-end tests require a key and are executed separately.
+The suite currently collects **2037 tests (current snapshot)**, all using fake models with no real API consumption by default; real end-to-end tests require a key and are executed separately.
 
 ### Fixed quality regression set and instruction-following scoring
 

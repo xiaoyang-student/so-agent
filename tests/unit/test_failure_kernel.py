@@ -299,6 +299,19 @@ class TestFailureFingerprint:
         fp2 = failure_fingerprint(FailureType.QUALITY, "第 2 次尝试失败：模拟错误")
         assert fp1 == fp2
 
+    def test_decimal_numbers_collapse(self):
+        """超时审计文本携带剩余预算小数（如 >899.998s 与 >900s）：小数
+        必须与整数同等规范化，否则同一根因每次尝试得到不同指纹、同因
+        抑制失效。"""
+        fp1 = failure_fingerprint(
+            FailureType.TIMEOUT, "单次执行超时（>900s，已终止，TimeoutError: 超预算）"
+        )
+        fp2 = failure_fingerprint(
+            FailureType.TIMEOUT,
+            "单次执行超时（>899.998s，已终止，TimeoutError: 超预算）",
+        )
+        assert fp1 == fp2
+
     def test_uuid_timestamp_path_hex_normalized(self):
         text = (
             "读取 C:\\Users\\demo\\task.py 与 /tmp/logs/a.log 失败 "
